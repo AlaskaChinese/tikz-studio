@@ -1143,13 +1143,13 @@ button {
 
 .advanced-preview-note {
   position: absolute;
-  bottom: 16px;
+  bottom: 64px;
   left: 16px;
   z-index: 6;
   display: flex;
   align-items: center;
   gap: 9px;
-  max-width: min(420px, calc(100% - 140px));
+  max-width: min(420px, calc(100% - 32px));
   padding: 7px 11px 7px 8px;
   border: 1px solid rgba(71, 107, 85, 0.18);
   border-radius: 9px;
@@ -3653,7 +3653,7 @@ button {
 
   .advanced-preview-note {
     right: 12px;
-    bottom: 12px;
+    bottom: 56px;
     left: 12px;
     max-width: none;
   }

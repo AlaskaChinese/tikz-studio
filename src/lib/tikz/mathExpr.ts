@@ -136,11 +136,12 @@ export function compileMathExpression(
       const operator = text[index];
       if (operator !== "*" && operator !== "/") break;
       index += 1;
+      const left = value;
       const right = parseUnary();
       value =
         operator === "*"
-          ? (values) => value(values) * right(values)
-          : (values) => value(values) / right(values);
+          ? (values) => left(values) * right(values)
+          : (values) => left(values) / right(values);
     }
     return value;
   }
@@ -152,11 +153,12 @@ export function compileMathExpression(
       const operator = text[index];
       if (operator !== "+" && operator !== "-") break;
       index += 1;
+      const left = value;
       const right = parseMultiplicative();
       value =
         operator === "+"
-          ? (values) => value(values) + right(values)
-          : (values) => value(values) - right(values);
+          ? (values) => left(values) + right(values)
+          : (values) => left(values) - right(values);
     }
     return value;
   }

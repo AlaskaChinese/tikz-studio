@@ -3744,3 +3744,11 @@ button {
 html:has(#qoder-sites-watermark) :is(.selection-panel, .selection-panel-fab) {
   bottom: calc(58px + env(safe-area-inset-bottom, 0px));
 }
+
+html:has(#qoder-sites-watermark) .help-backdrop {
+  padding-bottom: calc(62px + env(safe-area-inset-bottom, 0px));
+}
+
+html:has(#qoder-sites-watermark) .help-dialog {
+  max-height: min(680px, calc(100vh - 80px));
+}

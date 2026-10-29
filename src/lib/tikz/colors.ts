@@ -62,6 +62,16 @@ function mix(first: Rgb, second: Rgb, firstPercent: number): Rgb {
 
 const WHITE: Rgb = { r: 255, g: 253, b: 248 };
 
+export function baseColorName(hex: string): string | null {
+  const parsed = parseHex(hex);
+  if (!parsed) return null;
+  const normalized = toHex(parsed);
+  for (const [name, value] of Object.entries(BASE_COLORS)) {
+    if (value.toLowerCase() === normalized.toLowerCase()) return name;
+  }
+  return null;
+}
+
 function resolveDefinition(value: string, definitions: ColorDefinitions, seen: Set<string>): Rgb | null {
   const name = value.trim();
   if (!name || seen.has(name)) return null;

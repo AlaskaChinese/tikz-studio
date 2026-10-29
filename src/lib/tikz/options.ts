@@ -323,7 +323,9 @@ export function parseFontSize(tokens: ParsedOption[], fallback = DEFAULT_FONT_PX
     Huge: 31,
   };
 
-  const fontToken = tokens.find((token) => token.key === "font");
+  const fontToken = [...tokens]
+    .reverse()
+    .find((token) => token.key.trim() === "font");
   const raw = fontToken?.value ?? "";
   const sizeMatch = raw.match(/\\(tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)\b/);
   if (sizeMatch) return sizes[sizeMatch[1]] ?? fallback;

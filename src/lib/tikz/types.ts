@@ -39,6 +39,8 @@ export interface NodeStyle {
   minHeight?: number;
   minSize?: number;
   textWidth?: number;
+  textHeight?: number;
+  textDepth?: number;
   innerSep: number;
   fontSize: number;
   align: "left" | "center" | "right";
@@ -117,6 +119,7 @@ export interface RawEndpoint {
   nodeAnchor?: string;
   isRelative: boolean;
   isCycle?: boolean;
+  sourceSpan?: Span;
 }
 
 export interface ResolvedEndpoint {
@@ -124,6 +127,8 @@ export interface ResolvedEndpoint {
   nodeRef?: TikzNode;
   rawAnchor?: string;
   isBorderPoint: boolean;
+  raw?: string;
+  sourceSpan?: Span;
 }
 
 export interface CurveGeometry {
@@ -146,6 +151,8 @@ export interface PathSegment {
   from: ResolvedEndpoint;
   to: ResolvedEndpoint;
   labels: TikzLabel[];
+  connectorSpan?: Span;
+  generated?: boolean;
 }
 
 export interface TikzLabel {
@@ -192,6 +199,7 @@ export interface PathSubpath {
   segments: PathSegment[];
   start: ResolvedEndpoint;
   closed: boolean;
+  generated?: boolean;
   shape?: {
     kind: "rectangle" | "circle" | "ellipse";
     center?: Point;
@@ -233,6 +241,7 @@ export interface TikzPath {
   labels: TikzLabel[];
   fill: boolean;
   stroke: boolean;
+  generated?: boolean;
 }
 
 export interface SourceStats {

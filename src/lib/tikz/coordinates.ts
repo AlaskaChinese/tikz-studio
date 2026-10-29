@@ -32,10 +32,37 @@ export function parseNamedReference(raw: string): NamedReference | null {
   return null;
 }
 
+export function roundedCornerRadius(node: TikzNode): number {
+  if (node.style.shape !== "rounded") return 0;
+  return Math.max(
+    0,
+    Math.min(node.style.cornerRadius, node.width / 2, node.height / 2),
+  );
+}
+
 export function anchorOffset(node: TikzNode, anchorRaw: string | undefined): Point {
   const anchor = (anchorRaw ?? "center").trim().toLowerCase().replace(/\s+/g, " ");
   const halfWidth = node.width / 2;
   const halfHeight = node.height / 2;
+  const round = node.style.shape === "circle" || node.style.shape === "ellipse";
+  const diamond = node.style.shape === "diamond";
+  const radius = roundedCornerRadius(node);
+  const rounded = radius > 0;
+  const roundedInset = radius * (1 - Math.SQRT1_2);
+  const cornerX = round
+    ? halfWidth * Math.SQRT1_2
+    : diamond
+      ? halfWidth / 2
+      : rounded
+        ? halfWidth - roundedInset
+        : halfWidth;
+  const cornerY = round
+    ? halfHeight * Math.SQRT1_2
+    : diamond
+      ? halfHeight / 2
+      : rounded
+        ? halfHeight - roundedInset
+        : halfHeight;
 
   switch (anchor) {
     case "north":
@@ -48,16 +75,16 @@ export function anchorOffset(node: TikzNode, anchorRaw: string | undefined): Poi
       return { x: -halfWidth, y: 0 };
     case "north east":
     case "northeast":
-      return { x: halfWidth, y: halfHeight };
+      return { x: cornerX, y: cornerY };
     case "north west":
     case "northwest":
-      return { x: -halfWidth, y: halfHeight };
+      return { x: -cornerX, y: cornerY };
     case "south east":
     case "southeast":
-      return { x: halfWidth, y: -halfHeight };
+      return { x: cornerX, y: -cornerY };
     case "south west":
     case "southwest":
-      return { x: -halfWidth, y: -halfHeight };
+      return { x: -cornerX, y: -cornerY };
     case "base":
       return { x: 0, y: -halfHeight + node.style.fontSize * 0.18 / 48 };
     case "mid":
@@ -225,6 +252,26 @@ export function borderPoint(node: TikzNode, target: Point): Point {
     const xScale = Math.abs(dx) > 1e-8 ? halfWidth / Math.abs(dx) : Number.POSITIVE_INFINITY;
     const yScale = Math.abs(dy) > 1e-8 ? halfHeight / Math.abs(dy) : Number.POSITIVE_INFINITY;
     scale = Math.min(xScale, yScale);
+    const radius = roundedCornerRadius(node);
+    if (radius > 0) {
+      const edgeX = dx * scale;
+      const edgeY = dy * scale;
+      if (
+        Math.abs(edgeX) > halfWidth - radius + 1e-8 &&
+        Math.abs(edgeY) > halfHeight - radius + 1e-8
+      ) {
+        const cornerX = Math.sign(edgeX) * (halfWidth - radius);
+        const cornerY = Math.sign(edgeY) * (halfHeight - radius);
+        const a = dx * dx + dy * dy;
+        const b = -2 * (dx * cornerX + dy * cornerY);
+        const c = cornerX * cornerX + cornerY * cornerY - radius * radius;
+        const discriminant = b * b - 4 * a * c;
+        if (discriminant >= 0) {
+          const arcScale = (-b + Math.sqrt(discriminant)) / (2 * a);
+          if (arcScale > 0 && arcScale <= scale + 1e-8) scale = arcScale;
+        }
+      }
+    }
   }
 
   return { x: node.x + dx * scale, y: node.y + dy * scale };

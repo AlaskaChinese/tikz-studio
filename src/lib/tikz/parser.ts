@@ -55,6 +55,7 @@ import {
 } from "./coordinates";
 import { measureTikzText } from "./measure";
 import { parseColorDefinitions, resolveTikzColor } from "./colors";
+import { compileMathExpression, compileSingleVariable } from "./mathExpr";
 
 const KNOWN_PICTURE_COMMANDS = new Set([
   "node",
@@ -101,13 +102,77 @@ interface RawSegment {
   controls?: RawPathEndpoint[];
   labels: RawLabel[];
   bend?: { direction: "left" | "right"; angle: number };
+  connectorSpan?: Span;
+  generated?: boolean;
 }
 
 interface RawSubpath {
   start: RawPathEndpoint;
   segments: RawSegment[];
   closed: boolean;
+  generated?: boolean;
   shape?: PathSubpath["shape"];
+}
+
+interface PlotDomain {
+  min: number;
+  max: number;
+}
+
+interface PlotDefaults {
+  domain?: PlotDomain;
+  samples?: number;
+}
+
+const DEFAULT_PLOT_DOMAIN: PlotDomain = { min: -5, max: 5 };
+const DEFAULT_PLOT_SAMPLES = 25;
+
+function evaluateDomainValue(raw: string): number | null {
+  const text = raw.trim();
+  if (!text) return null;
+  const dimension = evaluateExpression(text);
+  if (dimension != null && Number.isFinite(dimension)) return dimension;
+  const compiled = compileMathExpression(text, []);
+  if (!compiled) return null;
+  const value = compiled({});
+  return Number.isFinite(value) ? value : null;
+}
+
+function parsePlotDomain(value: string | undefined): PlotDomain | null {
+  if (!value) return null;
+  const parts = splitTopLevel(value, 0, value.length, ":");
+  if (parts.length !== 2) return null;
+  const min = evaluateDomainValue(parts[0].text);
+  const max = evaluateDomainValue(parts[1].text);
+  if (min == null || max == null || !(max > min)) return null;
+  return { min, max };
+}
+
+function plotTokenDomain(tokens: ParsedOption[]): PlotDomain | undefined {
+  const token = [...tokens].reverse().find((item) => item.key.trim() === "domain");
+  return parsePlotDomain(token?.value) ?? undefined;
+}
+
+function plotTokenSamples(tokens: ParsedOption[]): number | undefined {
+  const token = [...tokens].reverse().find((item) => item.key.trim() === "samples");
+  if (!token?.value) return undefined;
+  const value = Number.parseInt(token.value.trim(), 10);
+  return Number.isFinite(value) ? Math.max(2, Math.min(400, value)) : undefined;
+}
+
+function generatedEndpoint(point: Point): RawPathEndpoint {
+  return {
+    raw: `${formatPlotNumber(point.x)},${formatPlotNumber(point.y)}`,
+    sourceStart: -1,
+    relative: null,
+    point: { x: point.x, y: point.y },
+  };
+}
+
+function formatPlotNumber(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  const rounded = Math.round(value * 1000) / 1000;
+  return String(rounded);
 }
 
 interface ParserState {
@@ -315,6 +380,8 @@ function parseNodeStyle(
   const minHeight = parseDimension(lastToken(tokens, "minimum height")?.value);
   const minSize = parseDimension(lastToken(tokens, "minimum size")?.value);
   const textWidth = parseDimension(lastToken(tokens, "text width")?.value);
+  const textHeight = parseDimension(lastToken(tokens, "text height")?.value);
+  const textDepth = parseDimension(lastToken(tokens, "text depth")?.value);
   const opacity = parseFloatOption(tokens, "opacity", 1);
   const fillOpacity = parseFloatOption(tokens, "fill opacity", opacity);
   const alignRaw = lastToken(tokens, "align")?.value?.trim();
@@ -323,10 +390,15 @@ function parseNodeStyle(
 
   const metrics = measureTikzText(rawText, fontSize);
   const innerPadding = innerSep * PX_PER_CM;
-  let widthPx = metrics.widthPx + innerPadding * 2;
-  let heightPx = metrics.heightPx + innerPadding * 2;
+  let widthPx =
+    textWidth != null
+      ? textWidth * PX_PER_CM + innerPadding * 2
+      : metrics.widthPx + innerPadding * 2;
+  let heightPx =
+    textHeight != null || textDepth != null
+      ? ((textHeight ?? 0) + (textDepth ?? 0)) * PX_PER_CM + innerPadding * 2
+      : metrics.heightPx + innerPadding * 2;
 
-  if (textWidth != null) widthPx = Math.max(widthPx, textWidth * PX_PER_CM);
   if (minWidth != null) widthPx = Math.max(widthPx, minWidth * PX_PER_CM);
   if (minHeight != null) heightPx = Math.max(heightPx, minHeight * PX_PER_CM);
   if (minSize != null) {
@@ -356,6 +428,8 @@ function parseNodeStyle(
     minHeight,
     minSize,
     textWidth,
+    textHeight,
+    textDepth,
     innerSep,
     fontSize,
     align,
@@ -428,6 +502,8 @@ function parsePictureOptions(
   everyNodeTokens: ParsedOption[];
   everyPathTokens: ParsedOption[];
   everyLabelTokens: ParsedOption[];
+  plotDomain?: PlotDomain;
+  plotSamples?: number;
 } {
   const optionsText = optionsRaw ? maskComments(optionsRaw) : "";
   const extra = optionsText ? [optionsText] : [];
@@ -462,6 +538,8 @@ function parsePictureOptions(
     everyNodeTokens: styleTokens(styles, "every node"),
     everyPathTokens: styleTokens(styles, "every path"),
     everyLabelTokens: styleTokens(styles, "every label"),
+    plotDomain: plotTokenDomain(pictureTokens),
+    plotSamples: plotTokenSamples(pictureTokens),
   };
 }
 
@@ -710,15 +788,16 @@ function parsePathStyle(
     stroke = true;
   }
 
+  const inheritedColor = parseColorToken(tokens, "color", state, null);
   const draw = drawToken
-    ? parseColorToken(tokens, "draw", state, stroke ? "#212720" : null)
+    ? parseColorToken(tokens, "draw", state, stroke ? inheritedColor ?? "#212720" : null)
     : stroke
-      ? "#212720"
+      ? inheritedColor ?? "#212720"
       : null;
   const fillColor = fillToken
-    ? parseColorToken(tokens, "fill", state, "#212720")
+    ? parseColorToken(tokens, "fill", state, inheritedColor ?? "#212720")
     : fill
-      ? "#212720"
+      ? inheritedColor ?? "#212720"
       : null;
   const opacity = parseFloatOption(tokens, "opacity", 1);
   const fillOpacity = parseFloatOption(tokens, "fill opacity", opacity);
@@ -1613,6 +1692,8 @@ function parsePathCommand(
     everyPathTokens: ParsedOption[];
     everyLabelTokens: ParsedOption[];
     styles: StyleMap;
+    plotDomain?: PlotDomain;
+    plotSamples?: number;
   },
   context: CoordinateContext,
 ): TikzPath | null {
@@ -1634,6 +1715,14 @@ function parsePathCommand(
 
   const expanded = expandStyleTokens([...picture.everyPathTokens, ...localTokens], picture.styles);
   const { style, stroke, fill } = parsePathStyle(expanded, state, commandName);
+  const pathDomain = plotTokenDomain(expanded) ?? picture.plotDomain;
+  const pathSamples = plotTokenSamples(expanded) ?? picture.plotSamples;
+  const pathStepToken = [...expanded].reverse().find((token) => token.key.trim() === "step");
+  const pathXStepToken = [...expanded].reverse().find((token) => token.key.trim() === "xstep");
+  const pathYStepToken = [...expanded].reverse().find((token) => token.key.trim() === "ystep");
+  const defaultGridStep = parseDimension(pathStepToken?.value, 1) ?? 1;
+  const defaultGridXStep = parseDimension(pathXStepToken?.value, defaultGridStep) ?? defaultGridStep;
+  const defaultGridYStep = parseDimension(pathYStepToken?.value, defaultGridStep) ?? defaultGridStep;
 
   const rawSubpaths: RawSubpath[] = [];
   let currentRawEndpoint: RawPathEndpoint | null = null;
@@ -1677,6 +1766,7 @@ function parsePathCommand(
     }
 
     if (state.masked.startsWith("--", cursor)) {
+      const connectorSpan = { start: cursor, end: cursor + 2 };
       cursor += 2;
       const labels: RawLabel[] = [];
       cursor = skipWhitespace(state.masked, cursor, commandEnd);
@@ -1724,6 +1814,7 @@ function parsePathCommand(
           endpointResult.endpoint,
           [...pendingLabels, ...labels],
         );
+        segment.connectorSpan = connectorSpan;
         currentSubpath.segments.push(segment);
         lastSegment = segment;
         currentRawEndpoint = endpointResult.endpoint;
@@ -1739,6 +1830,7 @@ function parsePathCommand(
       const kind = state.masked.startsWith("-|", cursor)
         ? "horizontal-vertical"
         : "vertical-horizontal";
+      const connectorSpan = { start: cursor, end: cursor + 2 };
       cursor += 2;
       const labels: RawLabel[] = [];
       cursor = skipWhitespace(state.masked, cursor, commandEnd);
@@ -1779,6 +1871,7 @@ function parsePathCommand(
           endpointResult.endpoint,
           [...pendingLabels, ...labels],
         );
+        segment.connectorSpan = connectorSpan;
         currentSubpath.segments.push(segment);
         lastSegment = segment;
         currentRawEndpoint = endpointResult.endpoint;
@@ -1791,6 +1884,7 @@ function parsePathCommand(
     }
 
     if (state.masked.startsWith("to", cursor) && !/[A-Za-z@]/.test(state.masked[cursor + 2] ?? "")) {
+      const connectorStart = cursor;
       cursor += 2;
       const toTokens: ParsedOption[] = [];
       cursor = skipWhitespace(state.masked, cursor, commandEnd);
@@ -1807,6 +1901,7 @@ function parsePathCommand(
           cursor = block.next;
         }
       }
+      const connectorSpan = { start: connectorStart, end: cursor };
       const labels: RawLabel[] = [];
       cursor = skipWhitespace(state.masked, cursor, commandEnd);
       while (
@@ -1859,6 +1954,7 @@ function parsePathCommand(
           undefined,
           bend,
         );
+        segment.connectorSpan = connectorSpan;
         currentSubpath.segments.push(segment);
         lastSegment = segment;
         currentRawEndpoint = endpointResult.endpoint;
@@ -1870,7 +1966,238 @@ function parsePathCommand(
       continue;
     }
 
+    if (state.masked.startsWith("plot", cursor) && !/[A-Za-z@]/.test(state.masked[cursor + 4] ?? "")) {
+      const plotTokens: ParsedOption[] = [];
+      let plotCursor = skipWhitespace(state.masked, cursor + 4, commandEnd);
+      while (state.masked[plotCursor] === "[") {
+        const block = readOptionBlock(state.masked, plotCursor, commandEnd);
+        if (!block) break;
+        plotTokens.push(
+          ...parseOptionTokens(state.masked, block.innerStart, block.innerEnd).map((token) => ({
+            key: token.key,
+            value: token.value,
+            raw: token.raw,
+          })),
+        );
+        plotCursor = skipWhitespace(state.masked, block.next, commandEnd);
+      }
+
+      const plotDomain = plotTokenDomain(plotTokens) ?? pathDomain ?? DEFAULT_PLOT_DOMAIN;
+      const plotSamples = plotTokenSamples(plotTokens) ?? pathSamples ?? DEFAULT_PLOT_SAMPLES;
+      const variableToken = [...plotTokens].reverse().find((token) => token.key.trim() === "variable");
+      const variable = (variableToken?.value ?? "x").replace(/\\/g, "").trim() || "x";
+      const isCoordinates =
+        state.masked.startsWith("coordinates", plotCursor) &&
+        !/[A-Za-z@]/.test(state.masked[plotCursor + "coordinates".length] ?? "");
+      const sampledPoints: Point[] = [];
+
+      if (isCoordinates) {
+        let groupCursor = skipWhitespace(
+          state.masked,
+          plotCursor + "coordinates".length,
+          commandEnd,
+        );
+        if (state.masked[groupCursor] !== "{") {
+          addIssue(state, "plot-coordinates", "plot coordinates 缺少坐标组", {
+            detail: "已跳过该 plot，其余图形仍会渲染。",
+          });
+          cursor = plotCursor;
+          continue;
+        }
+        const group = readBalancedContent(state.masked, groupCursor);
+        if (!group) {
+          cursor = plotCursor;
+          continue;
+        }
+        let inner = group.innerStart;
+        while (inner < group.innerEnd) {
+          inner = skipWhitespace(state.masked, inner, group.innerEnd);
+          if (state.masked[inner] !== "(") {
+            inner += 1;
+            continue;
+          }
+          const pointGroup = readBalancedContent(state.masked, inner, "(", ")");
+          if (!pointGroup) break;
+          const raw = state.source.slice(pointGroup.innerStart, pointGroup.innerEnd).trim();
+          const resolved = resolveRawCoordinate(raw, context);
+          if (resolved && Number.isFinite(resolved.point.x)) {
+            sampledPoints.push(resolved.point);
+          }
+          inner = pointGroup.end;
+        }
+        plotCursor = group.end;
+      } else if (state.masked[plotCursor] === "(") {
+        const group = readBalancedContent(state.masked, plotCursor, "(", ")");
+        if (!group) {
+          cursor = plotCursor;
+          continue;
+        }
+        const parts = splitTopLevel(state.source, group.innerStart, group.innerEnd, ",");
+        if (parts.length !== 2) {
+          addIssue(state, "plot-expression", "plot 需要 (x,y) 两个坐标表达式", {
+            detail: "已跳过该 plot，其余图形仍会渲染。",
+          });
+          cursor = group.end;
+          continue;
+        }
+        const xExpression = compileMathExpression(parts[0].text, [variable]);
+        const yExpression = compileMathExpression(parts[1].text, [variable]);
+        if (!xExpression || !yExpression) {
+          addIssue(state, "plot-expression", `无法解析函数 plot (${parts[0].text},${parts[1].text})`, {
+            detail: "支持 sin、cos、exp、sqrt 等 PGF 数学函数与 + - * / ^ 运算。",
+          });
+          cursor = group.end;
+          continue;
+        }
+        const samples = Math.max(2, plotSamples);
+        for (let sample = 0; sample < samples; sample += 1) {
+          const t =
+            samples === 1
+              ? plotDomain.min
+              : plotDomain.min + ((plotDomain.max - plotDomain.min) * sample) / (samples - 1);
+          const values = { [variable]: t };
+          const x = xExpression(values);
+          const y = yExpression(values);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+          sampledPoints.push({ x, y });
+        }
+        plotCursor = group.end;
+      } else {
+        cursor = plotCursor;
+        continue;
+      }
+
+      if (sampledPoints.length >= 2) {
+        const start = generatedEndpoint(sampledPoints[0]);
+        const generatedSubpath: RawSubpath = {
+          start,
+          segments: [],
+          closed: false,
+          generated: true,
+        };
+        let previous = start;
+        for (let sample = 1; sample < sampledPoints.length; sample += 1) {
+          const to = generatedEndpoint(sampledPoints[sample]);
+          const segment = makeSegment(
+            "line",
+            previous,
+            to,
+            sample === 1 ? [...pendingLabels] : [],
+          );
+          segment.generated = true;
+          generatedSubpath.segments.push(segment);
+          previous = to;
+        }
+        pendingLabels = [];
+        rawSubpaths.push(generatedSubpath);
+        currentSubpath = generatedSubpath;
+        currentRawEndpoint = previous;
+        lastSegment = generatedSubpath.segments[generatedSubpath.segments.length - 1];
+        lastPoint = sampledPoints[sampledPoints.length - 1];
+      } else {
+        addIssue(state, "plot-empty", "plot 没有产生可渲染的采样点", {
+          detail: "请检查 domain 与函数表达式。",
+        });
+      }
+      cursor = plotCursor;
+      subpathOpen = true;
+      continue;
+    }
+
+    if (state.masked.startsWith("grid", cursor) && !/[A-Za-z@]/.test(state.masked[cursor + 4] ?? "")) {
+      const gridTokens: ParsedOption[] = [];
+      let gridCursor = skipWhitespace(state.masked, cursor + 4, commandEnd);
+      while (state.masked[gridCursor] === "[") {
+        const block = readOptionBlock(state.masked, gridCursor, commandEnd);
+        if (!block) break;
+        gridTokens.push(
+          ...parseOptionTokens(state.masked, block.innerStart, block.innerEnd).map((token) => ({
+            key: token.key,
+            value: token.value,
+            raw: token.raw,
+          })),
+        );
+        gridCursor = skipWhitespace(state.masked, block.next, commandEnd);
+      }
+      const endpointResult = readPathEndpoint(state, gridCursor, commandEnd, context, lastPoint);
+      if (!endpointResult) {
+        cursor = gridCursor;
+        continue;
+      }
+      const from = currentRawEndpoint?.point ?? lastPoint;
+      if (!from) {
+        cursor = endpointResult.next;
+        continue;
+      }
+      const gridStepToken = [...gridTokens].reverse().find((token) => token.key.trim() === "step");
+      const gridXStepToken = [...gridTokens].reverse().find((token) => token.key.trim() === "xstep");
+      const gridYStepToken = [...gridTokens].reverse().find((token) => token.key.trim() === "ystep");
+      const step = parseDimension(gridStepToken?.value, defaultGridStep) ?? defaultGridStep;
+      const xStep = parseDimension(gridXStepToken?.value, step) ?? step;
+      const yStep = parseDimension(gridYStepToken?.value, step) ?? step;
+      const target = endpointResult.endpoint.point;
+
+      const axisValues = (startValue: number, endValue: number, stride: number): number[] => {
+        const values = [startValue];
+        const distanceValue = endValue - startValue;
+        if (Math.abs(distanceValue) < 1e-9) return values;
+        const directionValue = Math.sign(distanceValue);
+        const stepValue = Math.max(0.02, Math.abs(stride)) * directionValue;
+        let current = startValue;
+        let guard = 0;
+        while (guard < 200) {
+          current += stepValue;
+          if (directionValue > 0 ? current >= endValue - 1e-9 : current <= endValue + 1e-9) break;
+          values.push(current);
+          guard += 1;
+        }
+        if (Math.abs(values[values.length - 1] - endValue) > 1e-6) values.push(endValue);
+        return values;
+      };
+
+      const xs = axisValues(from.x, target.x, xStep);
+      const ys = axisValues(from.y, target.y, yStep);
+      let gridSegmentCount = 0;
+      let lastGridSegment: RawSegment | null = null;
+
+      for (const x of xs) {
+        const start = generatedEndpoint({ x, y: from.y });
+        const to = generatedEndpoint({ x, y: target.y });
+        const segment = makeSegment("line", start, to, []);
+        segment.generated = true;
+        rawSubpaths.push({ start, segments: [segment], closed: false, generated: true });
+        lastGridSegment = segment;
+        gridSegmentCount += 1;
+      }
+      for (const y of ys) {
+        const start = generatedEndpoint({ x: from.x, y });
+        const to = generatedEndpoint({ x: target.x, y });
+        const segment = makeSegment("line", start, to, []);
+        segment.generated = true;
+        rawSubpaths.push({ start, segments: [segment], closed: false, generated: true });
+        lastGridSegment = segment;
+        gridSegmentCount += 1;
+      }
+      if (gridSegmentCount > 0) {
+        lastSegment = lastGridSegment;
+      }
+      const continuation: RawSubpath = {
+        start: endpointResult.endpoint,
+        segments: [],
+        closed: false,
+        generated: true,
+      };
+      rawSubpaths.push(continuation);
+      currentSubpath = continuation;
+      currentRawEndpoint = endpointResult.endpoint;
+      lastPoint = target;
+      cursor = endpointResult.next;
+      subpathOpen = true;
+      continue;
+    }
+
     if (state.masked.startsWith("..", cursor)) {
+      const connectorStart = cursor;
       cursor += 2;
       cursor = skipWhitespace(state.masked, cursor, commandEnd);
       if (state.masked.startsWith("controls", cursor)) {
@@ -1890,6 +2217,7 @@ function parsePathCommand(
         }
         cursor = skipWhitespace(state.masked, cursor, commandEnd);
         if (state.masked.startsWith("..", cursor)) cursor += 2;
+        const connectorSpan = { start: connectorStart, end: cursor };
         cursor = skipWhitespace(state.masked, cursor, commandEnd);
         const labels: RawLabel[] = [];
         while (
@@ -1924,6 +2252,7 @@ function parsePathCommand(
             [...pendingLabels, ...labels],
             [first.endpoint, second?.endpoint ?? first.endpoint],
           );
+          segment.connectorSpan = connectorSpan;
           currentSubpath.segments.push(segment);
           lastSegment = segment;
           currentRawEndpoint = endpointResult.endpoint;
@@ -2032,6 +2361,7 @@ function parsePathCommand(
       segments: [],
       closed: rawSubpath.closed || Boolean(fill),
       shape: rawSubpath.shape,
+      generated: rawSubpath.generated,
     };
 
     for (const rawSegment of rawSubpath.segments) {
@@ -2158,11 +2488,14 @@ function parsePathCommand(
           nodeRef: rawSegment.to.nodeRef?.name,
           nodeAnchor: rawSegment.to.rawAnchor,
           isRelative: Boolean(rawSegment.to.relative),
+          sourceSpan: rawSegment.to.sourceSpan,
         },
         geometry,
         from,
         to,
         labels,
+        connectorSpan: rawSegment.connectorSpan,
+        generated: rawSegment.generated,
       });
     }
 
@@ -2179,6 +2512,14 @@ function parsePathCommand(
     labels: subpaths.flatMap((subpath) => subpath.segments.flatMap((segment) => segment.labels)),
     fill,
     stroke,
+    generated:
+      subpaths.length > 0 &&
+      subpaths.every(
+        (subpath) =>
+          subpath.generated &&
+          (subpath.segments.length === 0 ||
+            subpath.segments.every((segment) => segment.generated)),
+      ),
   };
 }
 
@@ -2207,5 +2548,7 @@ function resolveEndpointForRender(endpoint: RawPathEndpoint): ResolvedEndpoint {
     nodeRef: endpoint.nodeRef,
     rawAnchor: endpoint.rawAnchor,
     isBorderPoint: Boolean(endpoint.nodeRef && !endpoint.rawAnchor),
+    raw: endpoint.raw,
+    sourceSpan: endpoint.sourceSpan,
   };
 }

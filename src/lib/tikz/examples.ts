@@ -3,6 +3,7 @@ export interface TikzExample {
   name: string;
   eyebrow: string;
   code: string;
+  preview?: "circuitikz" | "pgfplots" | "tikz-cd" | "chemfig" | "chemfig-fragment";
 }
 
 export const TIKZ_EXAMPLES: TikzExample[] = [
@@ -42,74 +43,6 @@ export const TIKZ_EXAMPLES: TikzExample[] = [
   \draw[arrow] (canvas) -- (edit);
   \draw[arrow] (edit) -- (code);
   \draw[arrow, draw=accent] (code) -- node[above, font=\scriptsize, text=accent] {实时同步} (prompt);
-\end{tikzpicture}`,
-  },
-  {
-    id: "architecture",
-    name: "系统架构",
-    eyebrow: "架构图",
-    code: String.raw`\definecolor{ink}{HTML}{1D2421}
-\definecolor{paper}{HTML}{FFFCF5}
-\definecolor{signal}{HTML}{D85C3A}
-\definecolor{sea}{HTML}{356B6B}
-
-\begin{tikzpicture}[
-  node distance=0.9cm and 1.15cm,
-  every node/.style={font=\small},
-  comp/.style={
-    draw=ink!70,
-    fill=paper,
-    rounded corners=3pt,
-    minimum width=2.45cm,
-    minimum height=0.95cm,
-    inner sep=6pt
-  },
-  data/.style={comp, draw=sea, fill=sea!8},
-  arrow/.style={-{Stealth[length=2.2mm]}, draw=ink!65, thick},
-  guide/.style={draw=sea!70, thick}
-]
-  \node[comp] (gateway) at (0,2.2) {API 网关};
-  \node[comp] (auth) at (-2.6,0) {身份鉴权};
-  \node[comp] (agent) at (0,0) {Agent 编排};
-  \node[data] (memory) at (2.8,0) {长期记忆};
-
-  \draw[arrow] (gateway) -- (auth);
-  \draw[arrow] (gateway) -- (agent);
-  \draw[arrow] (gateway) -- node[right, font=\scriptsize, text=sea] {上下文} (memory);
-  \draw[guide, bend left=24] (auth) to node[above, font=\scriptsize, text=sea] {token} (agent);
-  \draw[guide, bend left=26] (memory) to node[above, font=\scriptsize, text=signal] {检索} (agent);
-\end{tikzpicture}`,
-  },
-  {
-    id: "geometry",
-    name: "几何与公式",
-    eyebrow: "示意图",
-    code: String.raw`\definecolor{ink}{HTML}{202520}
-\definecolor{paper}{HTML}{FFFCF5}
-\definecolor{accent}{HTML}{D85C3A}
-\definecolor{moss}{HTML}{3F6B57}
-
-\begin{tikzpicture}[
-  every node/.style={font=\small},
-  point/.style={
-    circle,
-    draw=accent,
-    fill=accent!14,
-    minimum size=0.66cm,
-    inner sep=0pt
-  },
-  arrow/.style={-{Stealth[length=2.2mm]}, draw=ink!70, thick}
-]
-  \coordinate (center) at (0,0);
-  \draw[draw=moss!80, fill=moss!7] (0,0) circle (1.65cm);
-  \draw[draw=ink!22, dashed] (-2.5,0) -- (2.5,0);
-  \draw[draw=ink!22, dashed] (0,-2.2) -- (0,2.2);
-
-  \node[point] (p) at (35:1.65) {};
-  \node[align=center, text=ink] at (-1.25,1.9) {单位圆\\[-1pt]{\scriptsize $r=1.65$}};
-  \draw[arrow] (0.35,0.18) -- (35:1.55) node[midway, above right, font=\scriptsize] {$r$};
-  \node[draw=ink!70, fill=paper, rounded corners=4pt, align=center, inner sep=7pt]
-    at (2.35,-1.6) {$\theta=35^\circ$\\[-1pt]{\scriptsize 极坐标}};
 \end{tikzpicture}`,
   },
   {
@@ -263,6 +196,141 @@ export const TIKZ_EXAMPLES: TikzExample[] = [
   \draw[edge, bend left=18] (x0) to node[above, pos=0.16, font=\scriptsize, text=signal!75] {回环检测} (x2);
   \draw[edge, draw=ink!35] (-7.9,-3.98) -- (7.9,-3.98) node[midway, below, font=\scriptsize, text=ink!45] {滑动窗口时间轴};
 \end{tikzpicture}`,
+  },
+  {
+    id: "function-plot",
+    name: "函数曲线与网格",
+    eyebrow: "函数图",
+    code: String.raw`\begin{document}
+  \begin{tikzpicture}[domain=0:4]
+    \draw[very thin,color=gray] (-0.1,-1.1) grid (3.9,3.9);
+    \draw[->] (-0.2,0) -- (4.2,0) node[right] {$x$};
+    \draw[->] (0,-1.2) -- (0,4.2) node[above] {$f(x)$};
+    \draw[color=red]    plot (\x,\x)             node[right] {$f(x) =x$};
+    \draw[color=blue]   plot (\x,{sin(\x r)})    node[right] {$f(x) = \sin x$};
+    \draw[color=orange] plot (\x,{0.05*exp(\x)}) node[right] {$f(x) = \frac{1}{20} \mathrm e^x$};
+  \end{tikzpicture}
+\end{document}`,
+  },
+  {
+    id: "circuit",
+    name: "电流源电路",
+    eyebrow: "电路图",
+    code: String.raw`\usepackage{circuitikz}
+\begin{document}
+
+\begin{circuitikz}[american, voltage shift=0.5]
+\draw (0,0)
+to[isource, l=$I_0$, v=$V_0$] (0,3)
+to[short, -*, i=$I_0$] (2,3)
+to[R=$R_1$, i>_=$i_1$] (2,0) -- (0,0);
+\draw (2,3) -- (4,3)
+to[R=$R_2$, i>_=$i_2$]
+(4,0) to[short, -*] (2,0);
+\end{circuitikz}
+
+\end{document}`,
+    preview: "circuitikz",
+  },
+  {
+    id: "surface-3d",
+    name: "三维高斯曲面",
+    eyebrow: "三维曲面",
+    code: String.raw`\usepackage{pgfplots}
+\pgfplotsset{compat=1.16}
+
+\begin{document}
+
+\begin{tikzpicture}
+\begin{axis}[colormap/viridis]
+\addplot3[
+	surf,
+	samples=18,
+	domain=-3:3
+]
+{exp(-x^2-y^2)*x};
+\end{axis}
+\end{tikzpicture}
+
+\end{document}`,
+    preview: "pgfplots",
+  },
+  {
+    id: "commutative-diagram",
+    name: "交换图表",
+    eyebrow: "范畴图",
+    code: String.raw`\usepackage{tikz-cd}
+
+\begin{document}
+\begin{tikzcd}
+
+    T
+    \arrow[drr, bend left, "x"]
+    \arrow[ddr, bend right, "y"]
+    \arrow[dr, dotted, "{(x,y)}" description] & & \\
+    K & X \times_Z Y \arrow[r, "p"] \arrow[d, "q"]
+    & X \arrow[d, "f"] \\
+    & Y \arrow[r, "g"]
+    & Z
+
+\end{tikzcd}
+
+\quad \quad
+
+\begin{tikzcd}[row sep=2.5em]
+
+A' \arrow[rr,"f'"] \arrow[dr,swap,"a"] \arrow[dd,swap,"g'"] &&
+  B' \arrow[dd,swap,"h'" near start] \arrow[dr,"b"] \\
+& A \arrow[rr,crossing over,"f" near start] &&
+  B \arrow[dd,"h"] \\
+C' \arrow[rr,"k'" near end] \arrow[dr,swap,"c"] && D' \arrow[dr,swap,"d"] \\
+& C \arrow[rr,"k"] \arrow[uu,<-,crossing over,"g" near end]&& D
+
+\end{tikzcd}
+
+\end{document}`,
+    preview: "tikz-cd",
+  },
+  {
+    id: "chemfig-lactam",
+    name: "β-内酰胺骨架",
+    eyebrow: "化学结构",
+    code: String.raw`\usepackage{chemfig}
+\begin{document}
+
+\chemfig{[:-90]HN(-[::-45](-[::-45]R)=[::+45]O)>[::+45]*4(-(=O)-N*5(-(<:(=[::-60]O)-[::+60]OH)-(<[::+0])(<:[::-108])-S>)--)}
+
+\end{document}`,
+    preview: "chemfig",
+  },
+  {
+    id: "chemfig-cage",
+    name: "笼状分子",
+    eyebrow: "化学结构",
+    code: String.raw`\usepackage{chemfig}
+\begin{document}
+
+\definesubmol\fragment1{
+
+    (-[:#1,0.85,,,draw=none]
+    -[::126]-[::-54](=_#(2pt,2pt)[::180])
+    -[::-70](-[::-56.2,1.07]=^#(2pt,2pt)[::180,1.07])
+    -[::110,0.6](-[::-148,0.60](=^[::180,0.35])-[::-18,1.1])
+    -[::50,1.1](-[::18,0.60]=_[::180,0.35])
+    -[::50,0.6]
+    -[::110])
+    }
+
+\chemfig{
+!\fragment{18}
+!\fragment{90}
+!\fragment{162}
+!\fragment{234}
+!\fragment{306}
+}
+
+\end{document}`,
+    preview: "chemfig-fragment",
   },
 ];
 

@@ -3,11 +3,13 @@ import {
   Braces,
   Check,
   ChevronDown,
+  CircleHelp,
   Copy,
   LayoutTemplate,
   Redo2,
   Scan,
   Undo2,
+  X,
 } from "lucide-react";
 import { DiagramCanvas } from "@/src/components/DiagramCanvas";
 import { SourceEditor } from "@/src/components/SourceEditor";
@@ -17,6 +19,7 @@ import {
   TIKZ_EXAMPLES,
 } from "@/src/lib/tikz/examples";
 import { parseTikz } from "@/src/lib/tikz/parser";
+import { getExactPreview } from "@/src/lib/tikz/previews";
 
 type ViewMode = "source" | "canvas";
 
@@ -50,7 +53,9 @@ export default function App() {
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const [fitSignal, setFitSignal] = useState(0);
   const [resetSignal, setResetSignal] = useState(0);
+  const [sourceFocusSignal, setSourceFocusSignal] = useState(0);
   const [examplesOpen, setExamplesOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("canvas");
@@ -65,6 +70,7 @@ export default function App() {
 
   sourceRef.current = source;
   const doc = useMemo(() => parseTikz(source), [source]);
+  const exactPreview = useMemo(() => getExactPreview(source), [source]);
   const activeExampleId = useMemo(() => {
     const trimmed = source.trim();
     if (trimmed === BLANK_TIKZ_SOURCE.trim()) return "blank";
@@ -79,7 +85,8 @@ export default function App() {
     const label = doc.labels.find((item) => item.key === primaryKey);
     if (label) return label.textSpan;
     const frame = doc.frames.find((item) => item.key === primaryKey);
-    return frame?.commandSpan ?? null;
+    if (frame) return frame.commandSpan;
+    return doc.paths.find((item) => item.key === primaryKey)?.commandSpan ?? null;
   }, [doc, primaryKey]);
 
   useEffect(() => {
@@ -88,11 +95,16 @@ export default function App() {
         (key) =>
           doc.nodes.some((node) => node.key === key) ||
           doc.labels.some((label) => label.key === key) ||
-          doc.frames.some((frame) => frame.key === key),
+          doc.frames.some((frame) => frame.key === key) ||
+          doc.paths.some((path) => path.key === key),
       );
       return next.length === current.length ? current : next;
     });
   }, [doc]);
+
+  useEffect(() => {
+    if (exactPreview) setSelectedKeys([]);
+  }, [exactPreview]);
 
   const syncHistoryFlags = useCallback(() => {
     setHistoryFlags({
@@ -205,6 +217,15 @@ export default function App() {
     const timer = window.setTimeout(() => setCopied(false), 1800);
     return () => window.clearTimeout(timer);
   }, [copied]);
+
+  useEffect(() => {
+    if (!helpOpen) return;
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setHelpOpen(false);
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
+  }, [helpOpen]);
 
   useEffect(() => {
     return () => {
@@ -329,6 +350,20 @@ export default function App() {
             </button>
           </div>
 
+          <button
+            type="button"
+            className={`button button-outline${helpOpen ? " is-open" : ""}`}
+            onClick={() => {
+              setExamplesOpen(false);
+              setHelpOpen(true);
+            }}
+            aria-haspopup="dialog"
+            title="帮助与快捷键"
+          >
+            <CircleHelp size={14} />
+            <span className="button-label">帮助</span>
+          </button>
+
           <div className="example-wrap" ref={exampleWrapRef}>
             <button
               type="button"
@@ -361,7 +396,12 @@ export default function App() {
                   >
                     <span className="example-index">{String(index + 1).padStart(2, "0")}</span>
                     <span className="example-text">
-                      <span className="example-name">{example.name}</span>
+                      <span className="example-name">
+                        {example.name}
+                        {example.preview ? (
+                          <span className="example-preview-badge">TeX 矢量</span>
+                        ) : null}
+                      </span>
                       <span className="example-eyebrow">{example.eyebrow}</span>
                     </span>
                     {activeExampleId === example.id ? (
@@ -390,7 +430,7 @@ export default function App() {
                   )}
                 </button>
                 <p className="example-menu-foot">
-                  支持常用 TikZ 子集与 KaTeX 公式，未知命令会跳过并提示。
+                  常用 TikZ 子集原生渲染；circuitikz、pgfplots、tikz-cd 与 chemfig 使用 TeX 预编译的精确矢量预览。
                 </p>
               </div>
             ) : null}
@@ -409,7 +449,15 @@ export default function App() {
       </header>
 
       <main className="workspace">
-        <section className={`source-pane${viewMode === "source" ? " is-mobile-active" : ""}`}>
+        <section
+          className={`source-pane${viewMode === "source" ? " is-mobile-active" : ""}`}
+          onMouseDown={(event) => {
+            const target = event.target as HTMLElement;
+            if (target.closest(".cm-editor")) return;
+            event.preventDefault();
+            setSourceFocusSignal((current) => current + 1);
+          }}
+        >
           <header className="pane-head source-head">
             <div className="pane-title">
               <span className="pane-index">01</span>
@@ -426,18 +474,36 @@ export default function App() {
             highlightKey={primaryKey}
             active={viewMode === "source"}
             resetSignal={resetSignal}
+            focusSignal={sourceFocusSignal}
           />
 
           <footer className="source-foot">
-            <span className={`source-status${warningCount > 0 ? " has-warning" : ""}`}>
-              <i />
-              {warningCount > 0 ? `${warningCount} 条兼容提示` : "解析正常"}
-            </span>
+            {exactPreview ? (
+              <span className="source-status is-preview">
+                <i />
+                {exactPreview.packageName} 精确预览
+              </span>
+            ) : (
+              <span className={`source-status${warningCount > 0 ? " has-warning" : ""}`}>
+                <i />
+                {warningCount > 0 ? `${warningCount} 条兼容提示` : "解析正常"}
+              </span>
+            )}
             <span className="source-stats">
-              <span>{doc.stats.nodes} 节点</span>
-              <span>{doc.stats.paths} 路径</span>
-              <span>{doc.stats.labels} 标签</span>
-              <span>{doc.stats.lines} 行</span>
+              {exactPreview ? (
+                <>
+                  <span>{exactPreview.packageLabel}</span>
+                  <span>TeX 预编译矢量</span>
+                  <span>编辑源码后回到原生渲染</span>
+                </>
+              ) : (
+                <>
+                  <span>{doc.stats.nodes} 节点</span>
+                  <span>{doc.stats.paths} 路径</span>
+                  <span>{doc.stats.labels} 标签</span>
+                  <span>{doc.stats.lines} 行</span>
+                </>
+              )}
             </span>
             <span className="source-privacy">本地解析 · 源码不会上传</span>
           </footer>
@@ -446,6 +512,7 @@ export default function App() {
         <DiagramCanvas
           doc={doc}
           source={source}
+          preview={exactPreview}
           selectedKeys={selectedKeys}
           onSelect={setSelectedKeys}
           onSourceChange={applySource}
@@ -454,6 +521,171 @@ export default function App() {
           mobileActive={viewMode === "canvas"}
         />
       </main>
+
+      {helpOpen ? (
+        <div
+          className="help-backdrop"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) setHelpOpen(false);
+          }}
+        >
+          <div
+            className="help-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="help-title"
+          >
+            <header className="help-head">
+              <div className="help-heading">
+                <span className="help-eyebrow">HELP · 操作速查</span>
+                <h2 id="help-title">画布快捷键与操作</h2>
+                <p>所有编辑都会实时写回左侧 TikZ 源码。</p>
+              </div>
+              <button
+                type="button"
+                className="help-close"
+                aria-label="关闭帮助"
+                autoFocus
+                onClick={() => setHelpOpen(false)}
+              >
+                <X size={15} />
+              </button>
+            </header>
+            <div className="help-body">
+              <section className="help-section" aria-labelledby="help-edit-title">
+                <h3 id="help-edit-title">选择与编辑</h3>
+                <div className="help-row">
+                  <span>移动组件</span>
+                  <span className="help-keys">
+                    <kbd>拖动</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>修改图形或连线上的文字</span>
+                  <span className="help-keys">
+                    <kbd>双击</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>框选组件</span>
+                  <span className="help-keys">
+                    <kbd>左键拖拽</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>加选或减选</span>
+                  <span className="help-keys">
+                    <kbd>Shift</kbd>
+                    <span>+</span>
+                    <kbd>点击</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>全选画布组件</span>
+                  <span className="help-keys">
+                    <kbd>Ctrl / ⌘</kbd>
+                    <span>+</span>
+                    <kbd>A</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>删除所选组件</span>
+                  <span className="help-keys">
+                    <kbd>Delete</kbd>
+                    <span>/</span>
+                    <kbd>Backspace</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>微移组件（按住 Shift 为 0.1cm）</span>
+                  <span className="help-keys">
+                    <kbd>方向键</kbd>
+                  </span>
+                </div>
+              </section>
+              <section className="help-section" aria-labelledby="help-edge-title">
+                <h3 id="help-edge-title">连线与吸附</h3>
+                <div className="help-row">
+                  <span>创建连线</span>
+                  <span className="help-keys">
+                    <kbd>拖动节点锚点</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>选中连线</span>
+                  <span className="help-keys">
+                    <kbd>单击路径</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>调整走向</span>
+                  <span className="help-keys">
+                    <kbd>拖动端点</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>重新吸附到节点</span>
+                  <span className="help-keys">
+                    <kbd>靠近锚点或中心</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>断开连接</span>
+                  <span className="help-keys">
+                    <kbd>属性面板 · 从节点取下</kbd>
+                  </span>
+                </div>
+              </section>
+              <section className="help-section" aria-labelledby="help-view-title">
+                <h3 id="help-view-title">视图与历史</h3>
+                <div className="help-row">
+                  <span>平移画布</span>
+                  <span className="help-keys">
+                    <kbd>手形工具</kbd>
+                    <span>/</span>
+                    <kbd>按住空格拖动</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>缩放画布</span>
+                  <span className="help-keys">
+                    <kbd>滚轮</kbd>
+                    <span>/</span>
+                    <kbd>触控板</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>适应全部内容</span>
+                  <span className="help-keys">
+                    <kbd>左下角 · 适应</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>撤销</span>
+                  <span className="help-keys">
+                    <kbd>Ctrl / ⌘</kbd>
+                    <span>+</span>
+                    <kbd>Z</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>重做</span>
+                  <span className="help-keys">
+                    <kbd>Ctrl / ⌘</kbd>
+                    <span>+</span>
+                    <kbd>Shift</kbd>
+                    <span>+</span>
+                    <kbd>Z</kbd>
+                  </span>
+                </div>
+              </section>
+            </div>
+            <footer className="help-foot">
+              支持常用 TikZ 子集与 KaTeX 公式；源码只在浏览器本地解析，不会上传。
+            </footer>
+          </div>
+        </div>
+      ) : null}
 
       {toast ? (
         <div className="toast" role="status">

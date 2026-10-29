@@ -8,33 +8,70 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
+  ArrowRight,
   Check,
   ChevronDown,
+  ChevronUp,
   CornerDownRight,
   Crosshair,
   Download,
+  Hand,
+  Layers,
   Loader2,
+  Magnet,
   Maximize2,
   Minus,
+  MousePointer2,
   Plus,
   Scaling,
+  SlidersHorizontal,
+  Trash2,
   TriangleAlert,
+  Unlink,
   X,
 } from "lucide-react";
 import { toBlob, toJpeg, toSvg } from "html-to-image";
+import {
+  collectAlignmentTargets,
+  EMPTY_GUIDES,
+  findAlignmentSnap,
+  findFeatureAlignmentSnap,
+  shiftedBounds,
+  type AlignmentGuides,
+  type AlignmentTargets,
+} from "@/src/lib/tikz/alignment";
+import { cubicPoint, nodeAnchorPoint } from "@/src/lib/tikz/coordinates";
 import { latexToHtml } from "@/src/lib/tikz/latexText";
 import { PX_PER_CM } from "@/src/lib/tikz/options";
+import { parseTikz } from "@/src/lib/tikz/parser";
 import {
+  attachPathEndpoint,
+  deleteSelectionObjects,
+  detachPathEndpoints,
+  insertConnector,
+  insertShapeNode,
   patchFrameGeometry,
+  patchLabelColor,
+  patchLabelFontSize,
   patchLabelOffset,
+  patchNodeColors,
+  patchNodeFontSize,
   patchNodeGeometry,
   patchNodePosition,
+  patchPathEndpoint,
+  patchPathSegmentCurve,
   patchSelectionScale,
   patchSelectionTranslation,
   patchText,
+  pathHasAttachedEndpoints,
   validateNodeText,
+  type BasicShapeKind,
   type SelectionEditObjects,
 } from "@/src/lib/tikz/patch";
+import {
+  previewBounds,
+  type PreviewSpec,
+} from "@/src/lib/tikz/previews";
 import type {
   Bounds,
   CurveGeometry,
@@ -54,11 +91,93 @@ const MIN_ZOOM = 0.15;
 const MAX_ZOOM = 4;
 const FIT_PADDING = 74;
 const EXPORT_PADDING = 32;
+const ALIGN_THRESHOLD_PX = 8;
+const COARSE_ALIGN_THRESHOLD_PX = 14;
+const ATTACH_REVEAL_PX = 96;
+const ATTACH_SNAP_PX = 16;
+const COARSE_ATTACH_SNAP_PX = 26;
 
 type Corner = "nw" | "ne" | "sw" | "se";
 type ExportFormat = "svg" | "png" | "jpg";
 type ViewportSize = { width: number; height: number };
 type Transform = { x: number; y: number; zoom: number };
+type ShapeTool = BasicShapeKind;
+type MarqueeType = "shapes" | "edges" | "labels" | "frames";
+type MarqueeFilter = Record<MarqueeType, boolean>;
+type NodeAnchor =
+  | "north"
+  | "north east"
+  | "east"
+  | "south east"
+  | "south"
+  | "south west"
+  | "west"
+  | "north west";
+
+const NODE_ANCHORS: NodeAnchor[] = [
+  "north",
+  "north east",
+  "east",
+  "south east",
+  "south",
+  "south west",
+  "west",
+  "north west",
+];
+
+const ANCHOR_LABELS: Record<NodeAnchor, string> = {
+  north: "上",
+  "north east": "右上",
+  east: "右",
+  "south east": "右下",
+  south: "下",
+  "south west": "左下",
+  west: "左",
+  "north west": "左上",
+};
+
+const SHAPE_TOOLS: Array<{ kind: ShapeTool; label: string; title: string }> = [
+  { kind: "rectangle", label: "矩形", title: "绘制矩形" },
+  { kind: "rounded", label: "圆角", title: "绘制圆角矩形" },
+  { kind: "circle", label: "圆形", title: "绘制圆形" },
+  { kind: "diamond", label: "菱形", title: "绘制菱形" },
+];
+
+const MARQUEE_TYPES: Array<{ kind: MarqueeType; label: string; detail: string }> = [
+  { kind: "shapes", label: "图形", detail: "节点与基本图案" },
+  { kind: "edges", label: "连线", detail: "箭头和路径" },
+  { kind: "labels", label: "标签", detail: "连线上的文字" },
+  { kind: "frames", label: "背景", detail: "背景板与底板" },
+];
+
+const DEFAULT_MARQUEE_FILTER: MarqueeFilter = {
+  shapes: true,
+  edges: true,
+  labels: true,
+  frames: false,
+};
+
+const DEFAULT_SHAPE_SIZE: Record<ShapeTool, { width: number; height: number }> = {
+  rectangle: { width: 2.4, height: 1.4 },
+  rounded: { width: 2.4, height: 1.4 },
+  circle: { width: 1.7, height: 1.7 },
+  diamond: { width: 2.2, height: 1.6 },
+};
+
+interface ShapeDraftState {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  kind: ShapeTool;
+}
+
+interface ConnectorDraftState {
+  from: Point;
+  to: Point;
+  targetNodeKey: string | null;
+  targetAnchor: NodeAnchor | null;
+}
 
 interface DragState {
   source: string;
@@ -110,17 +229,48 @@ interface FrameResizeState {
   moved: boolean;
 }
 
-interface FrameMoveState {
+interface PathEndpointHandle {
+  subpathIndex: number;
+  edge: "start" | "end";
+  point: Point;
+  attached: boolean;
+}
+
+interface PathCurveHandle {
+  subpathIndex: number;
+  segmentIndex: number;
+  point: Point;
+  chordMid: Point;
+  normal: Point;
+  controls: { c1: Point; c2: Point };
+  bent: boolean;
+}
+
+interface CurveDragState {
   source: string;
-  frame: TikzFrame;
+  path: TikzPath;
+  handle: PathCurveHandle;
   pointerId: number;
   startClientX: number;
   startClientY: number;
-  startMinX: number;
-  startMinY: number;
-  startMaxX: number;
-  startMaxY: number;
   moved: boolean;
+}
+
+interface PathAttachCandidate {
+  node: TikzNode;
+  anchor: NodeAnchor | "center";
+  point: Point;
+}
+
+interface PathAttachHint extends PathAttachCandidate {
+  active: boolean;
+}
+
+interface PinchState {
+  pointerIds: [number, number];
+  startDistance: number;
+  startMidpoint: Point;
+  startTransform: Transform;
 }
 
 interface MarqueeState {
@@ -135,6 +285,7 @@ interface SelectionInfo {
   title: string;
   meta: string[];
   editable?: TikzNode | TikzLabel;
+  path?: TikzPath;
   resizeHint?: boolean;
   multi?: boolean;
 }
@@ -148,6 +299,7 @@ interface EditingState {
 interface DiagramCanvasProps {
   doc: TikzDocument;
   source: string;
+  preview: PreviewSpec | null;
   selectedKeys: string[];
   onSelect: (keys: string[]) => void;
   onSourceChange: (source: string) => void;
@@ -162,11 +314,19 @@ function collectSelection(doc: TikzDocument, keys: string[]): SelectionEditObjec
     nodes: doc.nodes.filter((node) => wanted.has(node.key)),
     labels: doc.labels.filter((label) => wanted.has(label.key)),
     frames: doc.frames.filter((frame) => wanted.has(frame.key)),
+    paths: doc.paths.filter(
+      (path) => wanted.has(path.key) && isSelectableEdge(path),
+    ),
   };
 }
 
 function selectionSize(objects: SelectionEditObjects): number {
-  return objects.nodes.length + objects.labels.length + objects.frames.length;
+  return (
+    objects.nodes.length +
+    objects.labels.length +
+    objects.frames.length +
+    objects.paths.length
+  );
 }
 
 function selectionBounds(objects: SelectionEditObjects): Bounds | null {
@@ -191,6 +351,10 @@ function selectionBounds(objects: SelectionEditObjects): Bounds | null {
       maxY: frame.maxY,
     });
   }
+  for (const path of objects.paths) {
+    const next = pathBounds(path);
+    if (next) extend(next);
+  }
   return bounds;
 }
 
@@ -207,8 +371,523 @@ function snap(value: number, step: number): number {
   return Math.round(value / step) * step;
 }
 
+function alignmentThreshold(zoom: number, coarse: boolean): number {
+  const pixels = coarse ? COARSE_ALIGN_THRESHOLD_PX : ALIGN_THRESHOLD_PX;
+  return pixels / Math.max(0.05, zoom * PX_PER_CM);
+}
+
+function axisConstrainedPoint(
+  from: Point,
+  to: Point,
+  threshold: number,
+  force: boolean,
+): { point: Point; axis: "horizontal" | "vertical" | null } {
+  const dx = Math.abs(to.x - from.x);
+  const dy = Math.abs(to.y - from.y);
+  if (!force && Math.min(dx, dy) > threshold) return { point: to, axis: null };
+  if (dx <= dy) {
+    return { point: { x: from.x, y: to.y }, axis: "vertical" };
+  }
+  return { point: { x: to.x, y: from.y }, axis: "horizontal" };
+}
+
+function isSelectableEdge(path: TikzPath): boolean {
+  return (
+    !path.generated &&
+    path.stroke &&
+    Boolean(path.style.draw) &&
+    path.subpaths.some((subpath) => !subpath.shape && subpath.segments.length > 0)
+  );
+}
+
+function subpathPolyline(subpath: PathSubpath): Point[] {
+  const points: Point[] = [{ ...subpath.start.point }];
+  for (const segment of subpath.segments) {
+    if ("c1" in segment.geometry) {
+      const curve = segment.geometry as CurveGeometry;
+      for (let index = 1; index <= 16; index += 1) {
+        const t = index / 16;
+        const rest = 1 - t;
+        points.push({
+          x:
+            rest ** 3 * curve.from.x +
+            3 * rest ** 2 * t * curve.c1.x +
+            3 * rest * t ** 2 * curve.c2.x +
+            t ** 3 * curve.to.x,
+          y:
+            rest ** 3 * curve.from.y +
+            3 * rest ** 2 * t * curve.c1.y +
+            3 * rest * t ** 2 * curve.c2.y +
+            t ** 3 * curve.to.y,
+        });
+      }
+    } else {
+      points.push({ ...segment.geometry.to });
+    }
+  }
+  return points;
+}
+
+function pathBounds(path: TikzPath): Bounds | null {
+  let bounds: Bounds | null = null;
+  for (const subpath of path.subpaths) {
+    if (subpath.shape) continue;
+    for (const point of subpathPolyline(subpath)) {
+      if (!bounds) {
+        bounds = { minX: point.x, minY: point.y, maxX: point.x, maxY: point.y };
+      } else {
+        bounds.minX = Math.min(bounds.minX, point.x);
+        bounds.minY = Math.min(bounds.minY, point.y);
+        bounds.maxX = Math.max(bounds.maxX, point.x);
+        bounds.maxY = Math.max(bounds.maxY, point.y);
+      }
+    }
+  }
+  return bounds;
+}
+
+function distanceToSegment(point: Point, from: Point, to: Point): number {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared <= 1e-9) return Math.hypot(point.x - from.x, point.y - from.y);
+  const t = clamp(
+    ((point.x - from.x) * dx + (point.y - from.y) * dy) / lengthSquared,
+    0,
+    1,
+  );
+  return Math.hypot(point.x - (from.x + t * dx), point.y - (from.y + t * dy));
+}
+
+function distanceToPath(path: TikzPath, point: Point): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (const subpath of path.subpaths) {
+    if (subpath.shape) continue;
+    const points = subpathPolyline(subpath);
+    for (let index = 1; index < points.length; index += 1) {
+      best = Math.min(best, distanceToSegment(point, points[index - 1], points[index]));
+    }
+  }
+  return best;
+}
+
+function findEdgeAtPoint(
+  doc: TikzDocument,
+  point: Point,
+  tolerance: number,
+): TikzPath | null {
+  for (let index = doc.paths.length - 1; index >= 0; index -= 1) {
+    const path = doc.paths[index];
+    if (!isSelectableEdge(path)) continue;
+    if (distanceToPath(path, point) <= tolerance) return path;
+  }
+  return null;
+}
+
+function findFrameAtPoint(doc: TikzDocument, point: Point): TikzFrame | null {
+  let hit: TikzFrame | null = null;
+  for (const frame of doc.frames) {
+    if (
+      point.x < frame.minX ||
+      point.x > frame.maxX ||
+      point.y < frame.minY ||
+      point.y > frame.maxY
+    ) {
+      continue;
+    }
+    if (!hit || frame.width * frame.height < hit.width * hit.height) hit = frame;
+  }
+  return hit;
+}
+
+function segmentIntersectsBounds(from: Point, to: Point, range: Bounds): boolean {
+  let t0 = 0;
+  let t1 = 1;
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const checks: Array<[number, number]> = [
+    [-dx, from.x - range.minX],
+    [dx, range.maxX - from.x],
+    [-dy, from.y - range.minY],
+    [dy, range.maxY - from.y],
+  ];
+  for (const [direction, distance] of checks) {
+    if (Math.abs(direction) < 1e-9) {
+      if (distance < 0) return false;
+      continue;
+    }
+    const ratio = distance / direction;
+    if (direction < 0) t0 = Math.max(t0, ratio);
+    else t1 = Math.min(t1, ratio);
+    if (t0 > t1) return false;
+  }
+  return true;
+}
+
+function pathIntersectsBounds(path: TikzPath, range: Bounds): boolean {
+  for (const subpath of path.subpaths) {
+    if (subpath.shape) continue;
+    const points = subpathPolyline(subpath);
+    for (const point of points) {
+      if (
+        point.x >= range.minX &&
+        point.x <= range.maxX &&
+        point.y >= range.minY &&
+        point.y <= range.maxY
+      ) {
+        return true;
+      }
+    }
+    for (let index = 1; index < points.length; index += 1) {
+      if (segmentIntersectsBounds(points[index - 1], points[index], range)) return true;
+    }
+  }
+  return false;
+}
+
+function pathLength(path: TikzPath): number {
+  let total = 0;
+  for (const subpath of path.subpaths) {
+    if (subpath.shape) continue;
+    const points = subpathPolyline(subpath);
+    for (let index = 1; index < points.length; index += 1) {
+      total += Math.hypot(
+        points[index].x - points[index - 1].x,
+        points[index].y - points[index - 1].y,
+      );
+    }
+  }
+  return total;
+}
+
+function pathEndpointHandles(path: TikzPath): PathEndpointHandle[] {
+  const handles: PathEndpointHandle[] = [];
+  path.subpaths.forEach((subpath, subpathIndex) => {
+    if (subpath.shape || subpath.segments.length === 0) return;
+    handles.push({
+      subpathIndex,
+      edge: "start",
+      point: subpath.start.point,
+      attached: Boolean(subpath.start.nodeRef),
+    });
+    if (!subpath.closed) {
+      const segment = subpath.segments[subpath.segments.length - 1];
+      handles.push({
+        subpathIndex,
+        edge: "end",
+        point: segment.to.point,
+        attached: Boolean(segment.to.nodeRef),
+      });
+    }
+  });
+  return handles;
+}
+
+function pathCurveHandles(path: TikzPath, source: string): PathCurveHandle[] {
+  if (path.generated) return [];
+  const handles: PathCurveHandle[] = [];
+  path.subpaths.forEach((subpath, subpathIndex) => {
+    if (subpath.shape || subpath.generated) return;
+    subpath.segments.forEach((segment, segmentIndex) => {
+      if (segment.generated || !segment.connectorSpan) return;
+      if (segment.kind !== "line" && segment.kind !== "cubic") return;
+      const connector = source
+        .slice(segment.connectorSpan.start, segment.connectorSpan.end)
+        .trim();
+      if (connector !== "--" && connector !== "to" && !connector.startsWith("..")) {
+        return;
+      }
+      const from = segment.geometry.from;
+      const to = segment.geometry.to;
+      const length = Math.hypot(to.x - from.x, to.y - from.y);
+      if (length < 0.25) return;
+      const chordMid = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
+      let point: Point;
+      let controls: { c1: Point; c2: Point };
+      if ("c1" in segment.geometry) {
+        point = cubicPoint(from, segment.geometry.c1, segment.geometry.c2, to, 0.5);
+        controls = { c1: segment.geometry.c1, c2: segment.geometry.c2 };
+      } else {
+        point = chordMid;
+        controls = {
+          c1: { x: from.x + (to.x - from.x) / 3, y: from.y + (to.y - from.y) / 3 },
+          c2: {
+            x: from.x + ((to.x - from.x) * 2) / 3,
+            y: from.y + ((to.y - from.y) * 2) / 3,
+          },
+        };
+      }
+      const normal = { x: -(to.y - from.y) / length, y: (to.x - from.x) / length };
+      const offset =
+        (point.x - chordMid.x) * normal.x + (point.y - chordMid.y) * normal.y;
+      handles.push({
+        subpathIndex,
+        segmentIndex,
+        point,
+        chordMid,
+        normal,
+        controls,
+        bent: "c1" in segment.geometry || Math.abs(offset) > 0.02,
+      });
+    });
+  });
+  return handles;
+}
+
+function pointToBoundsDistance(point: Point, bounds: Bounds): number {
+  const dx = Math.max(bounds.minX - point.x, 0, point.x - bounds.maxX);
+  const dy = Math.max(bounds.minY - point.y, 0, point.y - bounds.maxY);
+  return Math.hypot(dx, dy);
+}
+
+function nearbyPathAnchors(
+  doc: TikzDocument,
+  points: Point[],
+  revealRadius: number,
+): PathAttachCandidate[] {
+  const candidates: PathAttachCandidate[] = [];
+  for (const node of doc.nodes) {
+    if (!node.name) continue;
+    if (
+      !points.some(
+        (point) => pointToBoundsDistance(point, node.bounds) <= revealRadius,
+      )
+    ) {
+      continue;
+    }
+    for (const anchor of NODE_ANCHORS) {
+      candidates.push({
+        node,
+        anchor,
+        point: nodeAnchorPoint(node, anchor),
+      });
+    }
+    candidates.push({
+      node,
+      anchor: "center",
+      point: nodeAnchorPoint(node, "center"),
+    });
+  }
+  return candidates;
+}
+
+function nearestPathAnchor(
+  candidates: PathAttachCandidate[],
+  points: Point[],
+  threshold: number,
+): PathAttachCandidate | null {
+  let best: PathAttachCandidate | null = null;
+  let bestDistance = threshold;
+  for (const candidate of candidates) {
+    for (const point of points) {
+      const distance = Math.hypot(
+        candidate.point.x - point.x,
+        candidate.point.y - point.y,
+      );
+      if (distance <= bestDistance) {
+        best = candidate;
+        bestDistance = distance;
+      }
+    }
+  }
+  return best;
+}
+
+function buildPathAttachHints(
+  candidates: PathAttachCandidate[],
+  active: PathAttachCandidate | null,
+): PathAttachHint[] {
+  return candidates.map((candidate) => ({
+    ...candidate,
+    active:
+      active !== null &&
+      candidate.node.key === active.node.key &&
+      candidate.anchor === active.anchor,
+  }));
+}
+
 function formatNumber(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function anchorUiStyle(node: TikzNode, anchor: NodeAnchor): CSSProperties {
+  const corner = anchor.includes(" ");
+  const shape = node.style.shape;
+  if (corner && shape === "rounded") {
+    const radius = Math.min(node.style.cornerRadius, node.width / 2, node.height / 2);
+    const inset = 1 - Math.SQRT1_2;
+    const edgeX = (radius * inset * 100) / Math.max(node.width, 1e-3);
+    const edgeY = (radius * inset * 100) / Math.max(node.height, 1e-3);
+    return {
+      left: `${anchor.includes("west") ? edgeX : 100 - edgeX}%`,
+      top: `${anchor.includes("north") ? edgeY : 100 - edgeY}%`,
+    };
+  }
+  let edge = 0;
+  if (corner && (shape === "circle" || shape === "ellipse")) {
+    edge = 50 - 50 * Math.SQRT1_2;
+  } else if (corner && shape === "diamond") {
+    edge = 25;
+  }
+  const left = anchor.includes("west") ? edge : anchor.includes("east") ? 100 - edge : 50;
+  const top = anchor.includes("north") ? edge : anchor.includes("south") ? 100 - edge : 50;
+  return { left: `${left}%`, top: `${top}%` };
+}
+
+function nearestNodeAnchor(node: TikzNode, point: Point): NodeAnchor {
+  let best: NodeAnchor = "north";
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const anchor of NODE_ANCHORS) {
+    const target = nodeAnchorPoint(node, anchor);
+    const distance = Math.hypot(target.x - point.x, target.y - point.y);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = anchor;
+    }
+  }
+  return best;
+}
+
+function findConnectorTarget(
+  doc: TikzDocument,
+  sourceKey: string,
+  point: Point,
+): { node: TikzNode; anchor: NodeAnchor } | null {
+  const margin = 0.14;
+  for (let index = doc.nodes.length - 1; index >= 0; index -= 1) {
+    const node = doc.nodes[index];
+    if (node.key === sourceKey) continue;
+    if (
+      point.x < node.bounds.minX - margin ||
+      point.x > node.bounds.maxX + margin ||
+      point.y < node.bounds.minY - margin ||
+      point.y > node.bounds.maxY + margin
+    ) {
+      continue;
+    }
+    return { node, anchor: nearestNodeAnchor(node, point) };
+  }
+  return null;
+}
+
+function ShapeToolIcon({ kind }: { kind: ShapeTool }) {
+  return (
+    <svg className="shape-tool-icon" viewBox="0 0 20 20" aria-hidden="true">
+      {kind === "rectangle" ? (
+        <rect x="2.6" y="4.8" width="14.8" height="10.4" rx="1.2" />
+      ) : kind === "rounded" ? (
+        <rect x="2.6" y="4.8" width="14.8" height="10.4" rx="4" />
+      ) : kind === "circle" ? (
+        <circle cx="10" cy="10" r="7.2" />
+      ) : (
+        <path d="M10 2.4 17.6 10 10 17.6 2.4 10Z" />
+      )}
+    </svg>
+  );
+}
+
+type ColorSession =
+  | { kind: "node"; key: string; source: string; node: TikzNode }
+  | { kind: "label"; key: string; source: string; label: TikzLabel };
+
+function ColorControl({
+  label,
+  value,
+  fallback = "#ffffff",
+  allowNone,
+  onPick,
+  onNone,
+  onSessionStart,
+}: {
+  label: string;
+  value: string | null;
+  fallback?: string;
+  allowNone?: boolean;
+  onPick: (value: string) => void;
+  onNone?: () => void;
+  onSessionStart: () => void;
+}) {
+  const none = allowNone === true && value === null;
+  const displayColor = value ?? fallback;
+  return (
+    <div className="color-row">
+      <span className="color-row-label">{label}</span>
+      <label
+        className={`color-chip${none ? " is-none" : ""}`}
+        title={`选择${label}颜色`}
+        onPointerDown={onSessionStart}
+      >
+        <input
+          type="color"
+          value={displayColor}
+          aria-label={`${label}颜色`}
+          onFocus={onSessionStart}
+          onChange={(event) => onPick(event.target.value)}
+        />
+        <span style={{ background: displayColor }} aria-hidden="true" />
+      </label>
+      <span className="color-row-value">{none ? "无" : (value ?? "默认").toUpperCase()}</span>
+      {allowNone ? (
+        <button
+          type="button"
+          className={`color-none${none ? " is-active" : ""}`}
+          aria-pressed={none}
+          title={none ? `恢复${label}` : `不显示${label}`}
+          onPointerDown={onSessionStart}
+          onClick={onNone}
+        >
+          无
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+const FONT_PT_MIN = 4;
+const FONT_PT_MAX = 96;
+
+function fontPointsFromPixels(px: number): number {
+  return Math.round((px * 72) / 96);
+}
+
+function FontSizeControl({
+  points,
+  onStep,
+}: {
+  points: number;
+  onStep: (delta: number) => void;
+}) {
+  return (
+    <div className="selection-font-row">
+      <span className="color-row-label">字号</span>
+      <div className="font-size-stepper">
+        <button
+          type="button"
+          className="font-size-button"
+          aria-label="减小字号"
+          title="减小 1pt"
+          disabled={points <= FONT_PT_MIN}
+          onClick={() => onStep(-1)}
+        >
+          <Minus size={11} />
+        </button>
+        <span className="font-size-value" aria-live="polite">
+          {points}
+          <small>pt</small>
+        </span>
+        <button
+          type="button"
+          className="font-size-button"
+          aria-label="增大字号"
+          title="增大 1pt"
+          disabled={points >= FONT_PT_MAX}
+          onClick={() => onStep(1)}
+        >
+          <Plus size={11} />
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function screenX(x: number): number {
@@ -479,6 +1158,21 @@ function DiamondShape({ node }: { node: TikzNode }) {
   );
 }
 
+function isTouchInsideNodeBody(event: ReactPointerEvent<HTMLSpanElement>) {
+  if (event.pointerType !== "touch") return false;
+  const nodeElement = event.currentTarget.closest(".tikz-node");
+  if (!(nodeElement instanceof HTMLElement)) return false;
+  const rect = nodeElement.getBoundingClientRect();
+  const marginX = Math.min(8, rect.width * 0.25);
+  const marginY = Math.min(8, rect.height * 0.25);
+  return (
+    event.clientX > rect.left + marginX &&
+    event.clientX < rect.right - marginX &&
+    event.clientY > rect.top + marginY &&
+    event.clientY < rect.bottom - marginY
+  );
+}
+
 function NodeView({
   node,
   selected,
@@ -491,6 +1185,7 @@ function NodeView({
   onResizeStart,
   onResizeMove,
   onResizeEnd,
+  onAnchorPointerDown,
 }: {
   node: TikzNode;
   selected: boolean;
@@ -507,6 +1202,11 @@ function NodeView({
   ) => void;
   onResizeMove: (event: ReactPointerEvent<HTMLSpanElement>) => void;
   onResizeEnd: (event: ReactPointerEvent<HTMLSpanElement>) => void;
+  onAnchorPointerDown: (
+    event: ReactPointerEvent<HTMLSpanElement>,
+    node: TikzNode,
+    anchor: NodeAnchor,
+  ) => void;
 }) {
   const style = node.style;
   const width = node.width * PX_PER_CM;
@@ -519,6 +1219,8 @@ function NodeView({
     opacity: style.opacity,
   };
   const padding = Math.min(style.innerSep * PX_PER_CM, Math.min(width, height) * 0.22);
+  const fixedTextHeight = style.textHeight != null || style.textDepth != null;
+  const wrapsText = style.textWidth != null && !fixedTextHeight;
   const contentStyle: CSSProperties = {
     padding:
       style.shape === "diamond"
@@ -527,7 +1229,7 @@ function NodeView({
     fontSize: `${style.fontSize}px`,
     color: style.textColor ?? "#232820",
     textAlign: style.align,
-    whiteSpace: style.textWidth ? "normal" : "nowrap",
+    whiteSpace: wrapsText ? "normal" : "nowrap",
     justifyContent:
       style.align === "left" ? "flex-start" : style.align === "right" ? "flex-end" : "center",
   };
@@ -565,7 +1267,7 @@ function NodeView({
         <span className="node-shape" style={nodeShapeStyle(node)} aria-hidden="true" />
       ) : null}
       <span
-        className={`node-content${style.textWidth ? " is-wrapping" : ""}`}
+        className={`node-content${wrapsText ? " is-wrapping" : ""}`}
         style={contentStyle}
       >
         <span
@@ -588,6 +1290,22 @@ function NodeView({
               onPointerMove={onResizeMove}
               onPointerUp={onResizeEnd}
               onPointerCancel={onResizeEnd}
+              onDoubleClick={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+            />
+          ))}
+          {NODE_ANCHORS.map((anchor) => (
+            <span
+              key={anchor}
+              className={`node-anchor anchor-${anchor.replace(/\s+/g, "-")}`}
+              style={anchorUiStyle(node, anchor)}
+              data-anchor={anchor}
+              title={`从${ANCHOR_LABELS[anchor]}侧锚点拖出连线`}
+              onPointerDown={(event) => {
+                if (isTouchInsideNodeBody(event)) return;
+                event.stopPropagation();
+                onAnchorPointerDown(event, node, anchor);
+              }}
               onDoubleClick={(event) => event.stopPropagation()}
               onClick={(event) => event.stopPropagation()}
             />
@@ -662,6 +1380,7 @@ function LabelView({
 export function DiagramCanvas({
   doc,
   source,
+  preview,
   selectedKeys,
   onSelect,
   onSourceChange,
@@ -674,18 +1393,25 @@ export function DiagramCanvas({
   const exportControlRef = useRef<HTMLDivElement>(null);
   const sourceRef = useRef(source);
   const docRef = useRef(doc);
+  const previewRef = useRef(preview);
   const dragRef = useRef<DragState | null>(null);
+  const curveDragRef = useRef<CurveDragState | null>(null);
   const resizeRef = useRef<ResizeState | null>(null);
   const labelDragRef = useRef<LabelDragState | null>(null);
   const frameResizeRef = useRef<FrameResizeState | null>(null);
-  const frameMoveRef = useRef<FrameMoveState | null>(null);
   const selectedKeysRef = useRef(selectedKeys);
   const editingRef = useRef<EditingState | null>(null);
+  const guideTargetsRef = useRef<AlignmentTargets>({ vertical: [], horizontal: [] });
   const transformRef = useRef<Transform>({ x: 0, y: 0, zoom: 1 });
   const sizeRef = useRef<ViewportSize>({ width: 0, height: 0 });
   const autoFitRef = useRef(true);
   const lastFitSignal = useRef(fitSignal);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const marqueeMenuRef = useRef<HTMLDivElement>(null);
+  const marqueeButtonRef = useRef<HTMLButtonElement>(null);
+  const pinchRef = useRef<PinchState | null>(null);
+  const touchPointsRef = useRef<Map<number, Point>>(new Map());
+  const multiTouchRef = useRef(false);
 
   const [transform, setTransform] = useState<Transform>({ x: 0, y: 0, zoom: 1 });
   const [panning, setPanning] = useState(false);
@@ -697,12 +1423,43 @@ export function DiagramCanvas({
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [marquee, setMarquee] = useState<MarqueeState | null>(null);
+  const [marqueeFilter, setMarqueeFilter] = useState<MarqueeFilter>(DEFAULT_MARQUEE_FILTER);
+  const [marqueeMenuOpen, setMarqueeMenuOpen] = useState(false);
+  const [marqueeMenuPos, setMarqueeMenuPos] = useState({ left: 14, top: 56 });
+  const [pinching, setPinching] = useState(false);
+  const [shapeTool, setShapeTool] = useState<ShapeTool | null>(null);
+  const [shapeDraft, setShapeDraft] = useState<ShapeDraftState | null>(null);
+  const [panTool, setPanTool] = useState(false);
+  const [spacePan, setSpacePan] = useState(false);
+  const [magnetOn, setMagnetOn] = useState(true);
+  const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuides>(EMPTY_GUIDES);
+  const [pathAttachHints, setPathAttachHints] = useState<PathAttachHint[]>([]);
+  const [selectionPanelCollapsed, setSelectionPanelCollapsed] = useState(false);
+  const [connectorDraft, setConnectorDraft] = useState<ConnectorDraftState | null>(null);
+  const [connectorArrow, setConnectorArrow] = useState(true);
+  const [connectorDashed, setConnectorDashed] = useState(false);
+  const shapeToolRef = useRef<ShapeTool | null>(shapeTool);
+  const panToolRef = useRef(panTool);
+  const spacePanRef = useRef(spacePan);
+  const magnetRef = useRef(magnetOn);
+  const connectorArrowRef = useRef(connectorArrow);
+  const connectorDashedRef = useRef(connectorDashed);
+  const marqueeFilterRef = useRef(marqueeFilter);
+  const colorSessionRef = useRef<ColorSession | null>(null);
 
   sourceRef.current = source;
   docRef.current = doc;
+  previewRef.current = preview;
   selectedKeysRef.current = selectedKeys;
   editingRef.current = editing;
   transformRef.current = transform;
+  shapeToolRef.current = shapeTool;
+  panToolRef.current = panTool;
+  spacePanRef.current = spacePan;
+  magnetRef.current = magnetOn;
+  connectorArrowRef.current = connectorArrow;
+  connectorDashedRef.current = connectorDashed;
+  marqueeFilterRef.current = marqueeFilter;
 
   const selectedKeySet = useMemo(() => new Set(selectedKeys), [selectedKeys]);
   const selectionObjects = useMemo(
@@ -724,6 +1481,42 @@ export function DiagramCanvas({
     () => (soleKey ? doc.frames.find((frame) => frame.key === soleKey) ?? null : null),
     [doc.frames, soleKey],
   );
+  const selectedPath = useMemo(
+    () =>
+      soleKey
+        ? doc.paths.find(
+            (path) => path.key === soleKey && isSelectableEdge(path),
+          ) ?? null
+        : null,
+    [doc.paths, soleKey],
+  );
+  const selectedFontPoints = selectedNode
+    ? fontPointsFromPixels(selectedNode.style.fontSize)
+    : selectedLabel
+      ? fontPointsFromPixels(selectedLabel.fontSize)
+      : null;
+  const selectedPathHandles = useMemo(
+    () => (selectedPath ? pathEndpointHandles(selectedPath) : []),
+    [selectedPath],
+  );
+  const selectedCurveHandles = useMemo(
+    () => (selectedPath ? pathCurveHandles(selectedPath, source) : []),
+    [selectedPath, source],
+  );
+  const pathAttachNodes = useMemo(() => {
+    const nodes = new Map<string, { node: TikzNode; active: boolean }>();
+    for (const hint of pathAttachHints) {
+      const current = nodes.get(hint.node.key);
+      nodes.set(hint.node.key, {
+        node: hint.node,
+        active: current?.active === true || hint.active,
+      });
+    }
+    return Array.from(nodes.values());
+  }, [pathAttachHints]);
+  const connectorTargetNode = connectorDraft?.targetNodeKey
+    ? (doc.nodes.find((node) => node.key === connectorDraft.targetNodeKey) ?? null)
+    : null;
 
   const selectOnly = useCallback(
     (key: string | null) => {
@@ -744,11 +1537,39 @@ export function DiagramCanvas({
     [onSelect],
   );
 
+  const toggleMarqueeMenu = useCallback(() => {
+    if (marqueeMenuOpen) {
+      setMarqueeMenuOpen(false);
+      return;
+    }
+    const button = marqueeButtonRef.current;
+    const viewport = viewportRef.current;
+    if (button && viewport) {
+      const buttonRect = button.getBoundingClientRect();
+      const viewportRect = viewport.getBoundingClientRect();
+      const menuWidth = 232;
+      const margin = 8;
+      const maxLeft = viewportRect.width - menuWidth - margin;
+      let left = buttonRect.left - viewportRect.left;
+      if (left > maxLeft) {
+        left = buttonRect.right - viewportRect.left - menuWidth;
+      }
+      setMarqueeMenuPos({
+        left: Math.max(margin, Math.min(left, maxLeft)),
+        top: buttonRect.bottom - viewportRect.top + 6,
+      });
+    }
+    setMarqueeMenuOpen(true);
+  }, [marqueeMenuOpen]);
+
   const fitToContent = useCallback(() => {
     const viewport = viewportRef.current;
     const { width, height } = sizeRef.current;
     if (!viewport || width < 80 || height < 80) return;
-    const bounds = docRef.current.bounds;
+    const activePreview = previewRef.current;
+    const bounds = activePreview
+      ? previewBounds(activePreview)
+      : docRef.current.bounds;
     const contentWidth = Math.max((bounds.maxX - bounds.minX) * PX_PER_CM, 72);
     const contentHeight = Math.max((bounds.maxY - bounds.minY) * PX_PER_CM, 72);
     const padding = Math.min(FIT_PADDING, Math.max(26, Math.min(width, height) * 0.09));
@@ -829,6 +1650,143 @@ export function DiagramCanvas({
   }, []);
 
   useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    let resetTimer: number | null = null;
+
+    const localPoint = (event: PointerEvent): Point => {
+      const rect = viewport.getBoundingClientRect();
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    };
+
+    const clearResetTimer = () => {
+      if (resetTimer != null) {
+        window.clearTimeout(resetTimer);
+        resetTimer = null;
+      }
+    };
+
+    const handleDown = (event: PointerEvent) => {
+      if (event.pointerType !== "touch") return;
+      const target = event.target as Element | null;
+      if (
+        target?.closest(
+          "[data-canvas-ui], input, textarea, select, [contenteditable='true']",
+        )
+      ) {
+        return;
+      }
+      touchPointsRef.current.set(event.pointerId, localPoint(event));
+      if (touchPointsRef.current.size < 2) return;
+
+      if (!pinchRef.current) {
+        clearResetTimer();
+        multiTouchRef.current = true;
+        dragRef.current = null;
+        resizeRef.current = null;
+        labelDragRef.current = null;
+        frameResizeRef.current = null;
+        setMarquee(null);
+        setShapeDraft(null);
+        setConnectorDraft(null);
+        setAlignmentGuides(EMPTY_GUIDES);
+        setPathAttachHints([]);
+        setPanning(false);
+        setIssuesOpen(false);
+        setPinching(true);
+        autoFitRef.current = false;
+        const entries = Array.from(touchPointsRef.current.entries()).slice(0, 2);
+        const first = entries[0];
+        const second = entries[1];
+        if (first && second) {
+          pinchRef.current = {
+            pointerIds: [first[0], second[0]],
+            startDistance: Math.max(
+              1,
+              Math.hypot(first[1].x - second[1].x, first[1].y - second[1].y),
+            ),
+            startMidpoint: {
+              x: (first[1].x + second[1].x) / 2,
+              y: (first[1].y + second[1].y) / 2,
+            },
+            startTransform: { ...transformRef.current },
+          };
+        }
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    const handleMove = (event: PointerEvent) => {
+      if (event.pointerType !== "touch") return;
+      if (!touchPointsRef.current.has(event.pointerId)) return;
+      touchPointsRef.current.set(event.pointerId, localPoint(event));
+      const pinch = pinchRef.current;
+      if (!pinch) return;
+      const first = touchPointsRef.current.get(pinch.pointerIds[0]);
+      const second = touchPointsRef.current.get(pinch.pointerIds[1]);
+      if (!first || !second) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const midpoint = {
+        x: (first.x + second.x) / 2,
+        y: (first.y + second.y) / 2,
+      };
+      const distance = Math.hypot(first.x - second.x, first.y - second.y);
+      const start = pinch.startTransform;
+      const zoom = clamp(
+        start.zoom * (distance / pinch.startDistance),
+        MIN_ZOOM,
+        MAX_ZOOM,
+      );
+      const anchorX =
+        (pinch.startMidpoint.x - start.x) / (start.zoom * PX_PER_CM);
+      const anchorY =
+        -(pinch.startMidpoint.y - start.y) / (start.zoom * PX_PER_CM);
+      setTransform({
+        zoom,
+        x: midpoint.x - anchorX * zoom * PX_PER_CM,
+        y: midpoint.y + anchorY * zoom * PX_PER_CM,
+      });
+    };
+
+    const handleUp = (event: PointerEvent) => {
+      if (event.pointerType !== "touch") return;
+      if (!touchPointsRef.current.has(event.pointerId)) return;
+      touchPointsRef.current.delete(event.pointerId);
+      if (pinchRef.current && touchPointsRef.current.size < 2) {
+        pinchRef.current = null;
+        setPinching(false);
+      }
+      if (touchPointsRef.current.size === 0 && multiTouchRef.current) {
+        clearResetTimer();
+        resetTimer = window.setTimeout(() => {
+          resetTimer = null;
+          multiTouchRef.current = false;
+        }, 0);
+      }
+    };
+
+    viewport.addEventListener("pointerdown", handleDown, {
+      capture: true,
+      passive: false,
+    });
+    window.addEventListener("pointermove", handleMove, {
+      capture: true,
+      passive: false,
+    });
+    window.addEventListener("pointerup", handleUp, true);
+    window.addEventListener("pointercancel", handleUp, true);
+    return () => {
+      clearResetTimer();
+      viewport.removeEventListener("pointerdown", handleDown, true);
+      window.removeEventListener("pointermove", handleMove, true);
+      window.removeEventListener("pointerup", handleUp, true);
+      window.removeEventListener("pointercancel", handleUp, true);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!editing) return;
     const exists =
       editing.kind === "node"
@@ -852,6 +1810,45 @@ export function DiagramCanvas({
       document.removeEventListener("keydown", handleKey);
     };
   }, [exportOpen]);
+
+  useEffect(() => {
+    if (!marqueeMenuOpen) return;
+    const handlePointer = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (marqueeMenuRef.current?.contains(target)) return;
+      if (marqueeButtonRef.current?.contains(target)) return;
+      setMarqueeMenuOpen(false);
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMarqueeMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointer);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointer);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [marqueeMenuOpen]);
+
+  useEffect(() => {
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (editingRef.current) return;
+      if (shapeToolRef.current || panToolRef.current) return;
+      if (marqueeMenuOpen) return;
+      if (!selectedKeysRef.current.length) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.closest("input, textarea, select, [contenteditable='true'], .cm-editor")
+      ) {
+        return;
+      }
+      event.preventDefault();
+      onSelect([]);
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
+  }, [marqueeMenuOpen, onSelect]);
 
   useEffect(() => {
     if (!editing) return;
@@ -904,13 +1901,344 @@ export function DiagramCanvas({
     closeEditor();
   }, [closeEditor, doc.labels, doc.nodes, draft, editing, onSourceChange]);
 
+  const beginColorSession = useCallback(
+    (kind: "node" | "label") => {
+      if (kind === "node") {
+        const key = selectedNode?.key;
+        if (!key) return;
+        const node = docRef.current.nodes.find((item) => item.key === key);
+        if (node) {
+          colorSessionRef.current = {
+            kind: "node",
+            key,
+            source: sourceRef.current,
+            node,
+          };
+        }
+        return;
+      }
+      const key = selectedLabel?.key;
+      if (!key) return;
+      const label = docRef.current.labels.find((item) => item.key === key);
+      if (label) {
+        colorSessionRef.current = {
+          kind: "label",
+          key,
+          source: sourceRef.current,
+          label,
+        };
+      }
+    },
+    [selectedLabel?.key, selectedNode?.key],
+  );
+
+  const changeNodeColor = useCallback(
+    (channel: "fill" | "draw" | "text", value: string | null) => {
+      const key = selectedNode?.key;
+      if (!key) return;
+      const session =
+        colorSessionRef.current?.kind === "node" && colorSessionRef.current.key === key
+          ? colorSessionRef.current
+          : null;
+      const node =
+        session?.node ?? docRef.current.nodes.find((item) => item.key === key);
+      if (!node) return;
+      const baseSource = session?.source ?? sourceRef.current;
+      const change =
+        channel === "fill"
+          ? { fill: value }
+          : channel === "draw"
+            ? { draw: value }
+            : { text: value };
+      const next = patchNodeColors(baseSource, node, change);
+      if (session) {
+        const nextNode =
+          parseTikz(next).nodes.find((item) => item.key === node.key) ?? null;
+        colorSessionRef.current = nextNode
+          ? { kind: "node", key, source: next, node: nextNode }
+          : null;
+      }
+      onSourceChange(next);
+    },
+    [onSourceChange, selectedNode?.key],
+  );
+
+  const changeLabelColor = useCallback(
+    (value: string) => {
+      const key = selectedLabel?.key;
+      if (!key) return;
+      const session =
+        colorSessionRef.current?.kind === "label" && colorSessionRef.current.key === key
+          ? colorSessionRef.current
+          : null;
+      const label =
+        session?.label ?? docRef.current.labels.find((item) => item.key === key);
+      if (!label) return;
+      const baseSource = session?.source ?? sourceRef.current;
+      const next = patchLabelColor(baseSource, label, value);
+      if (session) {
+        const nextLabel =
+          parseTikz(next).labels.find((item) => item.key === label.key) ?? null;
+        colorSessionRef.current = nextLabel
+          ? { kind: "label", key, source: next, label: nextLabel }
+          : null;
+      }
+      onSourceChange(next);
+    },
+    [onSourceChange, selectedLabel?.key],
+  );
+
+  const stepSelectedFontSize = useCallback(
+    (delta: number) => {
+      if (selectedNode) {
+        const current = fontPointsFromPixels(selectedNode.style.fontSize);
+        const next = Math.max(FONT_PT_MIN, Math.min(FONT_PT_MAX, current + delta));
+        if (next === current) return;
+        onSourceChange(
+          patchNodeFontSize(sourceRef.current, selectedNode, next),
+        );
+        return;
+      }
+      if (selectedLabel) {
+        const current = fontPointsFromPixels(selectedLabel.fontSize);
+        const next = Math.max(FONT_PT_MIN, Math.min(FONT_PT_MAX, current + delta));
+        if (next === current) return;
+        onSourceChange(
+          patchLabelFontSize(sourceRef.current, selectedLabel, next),
+        );
+      }
+    },
+    [onSourceChange, selectedLabel, selectedNode],
+  );
+
+  const activateShapeTool = useCallback(
+    (tool: ShapeTool | null) => {
+      setPanTool(false);
+      setShapeTool(tool);
+      setShapeDraft(null);
+      if (tool) {
+        setIssuesOpen(false);
+        if (editingRef.current) closeEditor();
+        onSelect([]);
+      }
+    },
+    [closeEditor, onSelect],
+  );
+
+  const togglePanTool = useCallback(() => {
+    const next = !panToolRef.current;
+    setPanTool(next);
+    if (!next) return;
+    setShapeTool(null);
+    setShapeDraft(null);
+    setIssuesOpen(false);
+    setAlignmentGuides(EMPTY_GUIDES);
+    if (editingRef.current) closeEditor();
+  }, [closeEditor]);
+
+  useEffect(() => {
+    if (!shapeTool && !panTool) return;
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setShapeTool(null);
+      setShapeDraft(null);
+      setPanTool(false);
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
+  }, [shapeTool, panTool]);
+
+  useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null) => {
+      const element = target as HTMLElement | null;
+      return Boolean(
+        element?.closest(
+          "input, textarea, select, [contenteditable='true'], .cm-editor, .tikz-node, .edge-label, button",
+        ),
+      );
+    };
+    const handleDown = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || event.repeat) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (editingRef.current) return;
+      if (isEditableTarget(event.target)) return;
+      event.preventDefault();
+      spacePanRef.current = true;
+      setSpacePan(true);
+      setAlignmentGuides(EMPTY_GUIDES);
+    };
+    const handleUp = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || !spacePanRef.current) return;
+      event.preventDefault();
+      spacePanRef.current = false;
+      setSpacePan(false);
+    };
+    const handleBlur = () => {
+      spacePanRef.current = false;
+      setSpacePan(false);
+    };
+    window.addEventListener("keydown", handleDown);
+    window.addEventListener("keyup", handleUp);
+    window.addEventListener("blur", handleBlur);
+    return () => {
+      window.removeEventListener("keydown", handleDown);
+      window.removeEventListener("keyup", handleUp);
+      window.removeEventListener("blur", handleBlur);
+    };
+  }, []);
+
+  const startConnector = useCallback(
+    (
+      event: ReactPointerEvent<HTMLSpanElement>,
+      node: TikzNode,
+      anchor: NodeAnchor,
+    ) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setIssuesOpen(false);
+      if (editingRef.current) closeEditor();
+      const viewport = viewportRef.current;
+      if (!viewport) return;
+      const rect = viewport.getBoundingClientRect();
+      const start = nodeAnchorPoint(node, anchor);
+      const pointerId = event.pointerId;
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      let moved = false;
+
+      const modelPoint = (clientX: number, clientY: number): Point => {
+        const current = transformRef.current;
+        return {
+          x: (clientX - rect.left - current.x) / (current.zoom * PX_PER_CM),
+          y: -(clientY - rect.top - current.y) / (current.zoom * PX_PER_CM),
+        };
+      };
+
+      setConnectorDraft({
+        from: start,
+        to: start,
+        targetNodeKey: null,
+        targetAnchor: null,
+      });
+      setAlignmentGuides(EMPTY_GUIDES);
+
+      const resolvePoint = (
+        clientX: number,
+        clientY: number,
+        shiftKey: boolean,
+        altKey: boolean,
+        pointerType: string,
+      ) => {
+        const point = modelPoint(clientX, clientY);
+        const target = findConnectorTarget(docRef.current, node.key, point);
+        if (target) {
+          return {
+            point: nodeAnchorPoint(target.node, target.anchor),
+            target,
+            guides: EMPTY_GUIDES,
+          };
+        }
+        let constrained: { point: Point; axis: "horizontal" | "vertical" | null } = {
+          point,
+          axis: null,
+        };
+        if (shiftKey) {
+          constrained = axisConstrainedPoint(start, point, 0, true);
+        } else if (magnetRef.current && !altKey) {
+          constrained = axisConstrainedPoint(
+            start,
+            point,
+            alignmentThreshold(transformRef.current.zoom, pointerType === "touch"),
+            false,
+          );
+        }
+        return {
+          point: constrained.point,
+          target: null,
+          guides:
+            constrained.axis === "horizontal"
+              ? { vertical: [], horizontal: [start.y] }
+              : constrained.axis === "vertical"
+                ? { vertical: [start.x], horizontal: [] }
+                : EMPTY_GUIDES,
+        };
+      };
+
+      let lastResolved: {
+        point: Point;
+        target: { node: TikzNode; anchor: NodeAnchor } | null;
+        guides: AlignmentGuides;
+      } | null = null;
+
+      const handleMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId) return;
+        if (multiTouchRef.current) return;
+        if (
+          !moved &&
+          Math.hypot(moveEvent.clientX - startClientX, moveEvent.clientY - startClientY) < 3
+        ) {
+          return;
+        }
+        moved = true;
+        const resolved = resolvePoint(
+          moveEvent.clientX,
+          moveEvent.clientY,
+          moveEvent.shiftKey,
+          moveEvent.altKey,
+          moveEvent.pointerType,
+        );
+        lastResolved = resolved;
+        setAlignmentGuides(moveEvent.altKey ? EMPTY_GUIDES : resolved.guides);
+        setConnectorDraft({
+          from: start,
+          to: resolved.point,
+          targetNodeKey: resolved.target?.node.key ?? null,
+          targetAnchor: resolved.target?.anchor ?? null,
+        });
+      };
+
+      const finish = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        setConnectorDraft(null);
+        setAlignmentGuides(EMPTY_GUIDES);
+        if (!moved || !lastResolved || upEvent.type === "pointercancel" || multiTouchRef.current) {
+          return;
+        }
+        const resolved = lastResolved;
+        const result = insertConnector(sourceRef.current, docRef.current, {
+          from: { node, anchor },
+          to: resolved.target
+            ? { node: resolved.target.node, anchor: resolved.target.anchor }
+            : undefined,
+          point: resolved.point,
+          arrow: connectorArrowRef.current,
+          dashed: connectorDashedRef.current,
+        });
+        onSourceChange(result.source);
+        if (result.fromKey) onSelect([result.fromKey]);
+      };
+
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [closeEditor, onSelect, onSourceChange],
+  );
+
   const exportDiagram = useCallback(
     async (format: ExportFormat) => {
       const layer = layerRef.current;
       if (!layer || exporting) return;
       setExportError(null);
       setExporting(format);
-      const bounds = docRef.current.bounds;
+      const activePreview = previewRef.current;
+      const bounds = activePreview
+        ? previewBounds(activePreview)
+        : docRef.current.bounds;
       let minX = bounds.minX * PX_PER_CM;
       let maxX = bounds.maxX * PX_PER_CM;
       let minY = -bounds.maxY * PX_PER_CM;
@@ -948,7 +2276,7 @@ export function DiagramCanvas({
       clone.style.willChange = "auto";
       clone
         .querySelectorAll(
-          ".selection-outline, .node-badge, .resize-handle, .frame-overlay, .group-selection, .frame-highlight, .marquee-box",
+          ".selection-outline, .node-badge, .resize-handle, .node-anchor, .frame-overlay, .group-selection, .frame-highlight, .edge-selection-layer, .path-endpoint-handle, .path-attach-node, .path-attach-anchor, .marquee-box, .connector-preview, .connector-target-outline, .shape-draft",
         )
         .forEach((element) => element.remove());
       clone.querySelectorAll(".is-selected").forEach((element) => {
@@ -1020,6 +2348,11 @@ export function DiagramCanvas({
       event.stopPropagation();
       setIssuesOpen(false);
       if (editingRef.current) closeEditor();
+      guideTargetsRef.current = collectAlignmentTargets(
+        docRef.current,
+        new Set(selectedKeysRef.current),
+      );
+      setAlignmentGuides(EMPTY_GUIDES);
       const target = event.currentTarget;
       const source = sourceRef.current;
       const pointerId = event.pointerId;
@@ -1033,7 +2366,7 @@ export function DiagramCanvas({
       }
 
       const handleMove = (moveEvent: PointerEvent) => {
-        if (moveEvent.pointerId !== pointerId) return;
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
         const deltaX = moveEvent.clientX - startClientX;
         const deltaY = moveEvent.clientY - startClientY;
         if (!moved && Math.hypot(deltaX, deltaY) < 2) return;
@@ -1045,9 +2378,38 @@ export function DiagramCanvas({
           if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
           else dx = 0;
         }
+        const allowX = !moveEvent.shiftKey || dx !== 0;
+        const allowY = !moveEvent.shiftKey || dy !== 0;
+        const bounds = selectionBounds(objects);
+        const guide =
+          bounds === null
+            ? null
+            : findAlignmentSnap(
+                shiftedBounds(bounds, dx, dy),
+                guideTargetsRef.current,
+                alignmentThreshold(
+                  transformRef.current.zoom,
+                  moveEvent.pointerType === "touch",
+                ),
+              );
+        const magnet = magnetRef.current && !moveEvent.altKey;
+        if (guide && magnet && allowX && guide.snappedX) dx += guide.dx;
+        if (guide && magnet && allowY && guide.snappedY) dy += guide.dy;
+        setAlignmentGuides(
+          moveEvent.altKey || !guide
+            ? EMPTY_GUIDES
+            : {
+                vertical: allowX ? guide.guides.vertical : [],
+                horizontal: allowY ? guide.guides.horizontal : [],
+              },
+        );
         const step = moveEvent.altKey ? 0 : 0.1;
+        const finalDx =
+          guide && magnet && allowX && guide.snappedX ? dx : snap(dx, step);
+        const finalDy =
+          guide && magnet && allowY && guide.snappedY ? dy : snap(dy, step);
         onSourceChange(
-          patchSelectionTranslation(source, objects, snap(dx, step), snap(dy, step)),
+          patchSelectionTranslation(source, objects, finalDx, finalDy),
         );
       };
 
@@ -1056,12 +2418,18 @@ export function DiagramCanvas({
         window.removeEventListener("pointermove", handleMove);
         window.removeEventListener("pointerup", finish);
         window.removeEventListener("pointercancel", finish);
+        setAlignmentGuides(EMPTY_GUIDES);
         try {
           target.releasePointerCapture(pointerId);
         } catch {
           // Ignore a pointer that the browser already released.
         }
-        if (!moved && clickedKey && upEvent.type !== "pointercancel") {
+        if (
+          !moved &&
+          clickedKey &&
+          upEvent.type !== "pointercancel" &&
+          !multiTouchRef.current
+        ) {
           selectOnly(clickedKey);
         }
       };
@@ -1096,7 +2464,7 @@ export function DiagramCanvas({
       }
 
       const handleMove = (moveEvent: PointerEvent) => {
-        if (moveEvent.pointerId !== pointerId) return;
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
         const deltaX = moveEvent.clientX - startClientX;
         const deltaY = moveEvent.clientY - startClientY;
         if (!moved && Math.hypot(deltaX, deltaY) < 1) return;
@@ -1149,6 +2517,7 @@ export function DiagramCanvas({
 
   const startDrag = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>, node: TikzNode) => {
+      if (shapeToolRef.current) return;
       if (event.button !== 0) return;
       event.stopPropagation();
       event.preventDefault();
@@ -1165,6 +2534,11 @@ export function DiagramCanvas({
         return;
       }
       selectOnly(node.key);
+      guideTargetsRef.current = collectAlignmentTargets(
+        docRef.current,
+        new Set([...selectedKeysRef.current, node.key]),
+      );
+      setAlignmentGuides(EMPTY_GUIDES);
       event.currentTarget.setPointerCapture(event.pointerId);
       dragRef.current = {
         source: sourceRef.current,
@@ -1183,7 +2557,7 @@ export function DiagramCanvas({
   const moveDrag = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       const drag = dragRef.current;
-      if (!drag || event.pointerId !== drag.pointerId) return;
+      if (!drag || event.pointerId !== drag.pointerId || multiTouchRef.current) return;
       const deltaX = event.clientX - drag.startClientX;
       const deltaY = event.clientY - drag.startClientY;
       if (!drag.moved && Math.hypot(deltaX, deltaY) < 2) return;
@@ -1195,9 +2569,33 @@ export function DiagramCanvas({
         if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
         else dx = 0;
       }
+      const allowX = !event.shiftKey || dx !== 0;
+      const allowY = !event.shiftKey || dy !== 0;
+      const guide = findAlignmentSnap(
+        shiftedBounds(drag.node.bounds, dx, dy),
+        guideTargetsRef.current,
+        alignmentThreshold(transformRef.current.zoom, event.pointerType === "touch"),
+      );
+      const magnet = magnetRef.current && !event.altKey;
+      if (magnet && allowX && guide.snappedX) dx += guide.dx;
+      if (magnet && allowY && guide.snappedY) dy += guide.dy;
+      setAlignmentGuides(
+        event.altKey
+          ? EMPTY_GUIDES
+          : {
+              vertical: allowX ? guide.guides.vertical : [],
+              horizontal: allowY ? guide.guides.horizontal : [],
+            },
+      );
       const step = event.altKey ? 0 : 0.1;
-      const x = snap(drag.startX + dx, step);
-      const y = snap(drag.startY + dy, step);
+      const x =
+        magnet && allowX && guide.snappedX
+          ? drag.startX + dx
+          : snap(drag.startX + dx, step);
+      const y =
+        magnet && allowY && guide.snappedY
+          ? drag.startY + dy
+          : snap(drag.startY + dy, step);
       onSourceChange(patchNodePosition(drag.source, drag.node, x, y));
     },
     [onSourceChange, transform.zoom],
@@ -1207,6 +2605,7 @@ export function DiagramCanvas({
     const drag = dragRef.current;
     if (!drag || event.pointerId !== drag.pointerId) return;
     dragRef.current = null;
+    setAlignmentGuides(EMPTY_GUIDES);
     try {
       event.currentTarget.releasePointerCapture(event.pointerId);
     } catch {
@@ -1216,6 +2615,7 @@ export function DiagramCanvas({
 
   const startLabelDrag = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>, label: TikzLabel) => {
+      if (shapeToolRef.current) return;
       if (event.button !== 0) return;
       event.stopPropagation();
       event.preventDefault();
@@ -1232,6 +2632,11 @@ export function DiagramCanvas({
         return;
       }
       selectOnly(label.key);
+      guideTargetsRef.current = collectAlignmentTargets(
+        docRef.current,
+        new Set([...selectedKeysRef.current, label.key]),
+      );
+      setAlignmentGuides(EMPTY_GUIDES);
       event.currentTarget.setPointerCapture(event.pointerId);
       labelDragRef.current = {
         source: sourceRef.current,
@@ -1250,7 +2655,7 @@ export function DiagramCanvas({
   const moveLabelDrag = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       const drag = labelDragRef.current;
-      if (!drag || event.pointerId !== drag.pointerId) return;
+      if (!drag || event.pointerId !== drag.pointerId || multiTouchRef.current) return;
       const deltaX = event.clientX - drag.startClientX;
       const deltaY = event.clientY - drag.startClientY;
       if (!drag.moved && Math.hypot(deltaX, deltaY) < 2) return;
@@ -1262,9 +2667,35 @@ export function DiagramCanvas({
         if (Math.abs(deltaX) >= Math.abs(deltaY)) shiftY = drag.startShiftY;
         else shiftX = drag.startShiftX;
       }
+      const allowX = !event.shiftKey || shiftX !== drag.startShiftX;
+      const allowY = !event.shiftKey || shiftY !== drag.startShiftY;
+      const guide = findAlignmentSnap(
+        shiftedBounds(
+          drag.label.bounds,
+          shiftX - drag.startShiftX,
+          shiftY - drag.startShiftY,
+        ),
+        guideTargetsRef.current,
+        alignmentThreshold(transformRef.current.zoom, event.pointerType === "touch"),
+      );
+      const magnet = magnetRef.current && !event.altKey;
+      if (magnet && allowX && guide.snappedX) shiftX += guide.dx;
+      if (magnet && allowY && guide.snappedY) shiftY += guide.dy;
+      setAlignmentGuides(
+        event.altKey
+          ? EMPTY_GUIDES
+          : {
+              vertical: allowX ? guide.guides.vertical : [],
+              horizontal: allowY ? guide.guides.horizontal : [],
+            },
+      );
       const step = event.altKey ? 0 : 0.1;
+      const nextShiftX =
+        magnet && allowX && guide.snappedX ? shiftX : snap(shiftX, step);
+      const nextShiftY =
+        magnet && allowY && guide.snappedY ? shiftY : snap(shiftY, step);
       onSourceChange(
-        patchLabelOffset(drag.source, drag.label, snap(shiftX, step), snap(shiftY, step)),
+        patchLabelOffset(drag.source, drag.label, nextShiftX, nextShiftY),
       );
     },
     [onSourceChange, transform.zoom],
@@ -1274,6 +2705,7 @@ export function DiagramCanvas({
     const drag = labelDragRef.current;
     if (!drag || event.pointerId !== drag.pointerId) return;
     labelDragRef.current = null;
+    setAlignmentGuides(EMPTY_GUIDES);
     try {
       event.currentTarget.releasePointerCapture(event.pointerId);
     } catch {
@@ -1312,7 +2744,7 @@ export function DiagramCanvas({
   const moveResize = useCallback(
     (event: ReactPointerEvent<HTMLSpanElement>) => {
       const resize = resizeRef.current;
-      if (!resize || event.pointerId !== resize.pointerId) return;
+      if (!resize || event.pointerId !== resize.pointerId || multiTouchRef.current) return;
       const deltaX = event.clientX - resize.startClientX;
       const deltaY = event.clientY - resize.startClientY;
       if (!resize.moved && Math.hypot(deltaX, deltaY) < 1) return;
@@ -1371,6 +2803,7 @@ export function DiagramCanvas({
       if (event.button !== 0) return;
       event.stopPropagation();
       event.preventDefault();
+      viewportRef.current?.focus({ preventScroll: true });
       event.currentTarget.setPointerCapture(event.pointerId);
       setIssuesOpen(false);
       selectOnly(frame.key);
@@ -1394,7 +2827,7 @@ export function DiagramCanvas({
   const moveFrameResize = useCallback(
     (event: ReactPointerEvent<HTMLSpanElement>) => {
       const resize = frameResizeRef.current;
-      if (!resize || event.pointerId !== resize.pointerId) return;
+      if (!resize || event.pointerId !== resize.pointerId || multiTouchRef.current) return;
       const deltaX = event.clientX - resize.startClientX;
       const deltaY = event.clientY - resize.startClientY;
       if (!resize.moved && Math.hypot(deltaX, deltaY) < 1) return;
@@ -1436,84 +2869,551 @@ export function DiagramCanvas({
     }
   }, []);
 
-  const startFrameMove = useCallback(
-    (event: ReactPointerEvent<HTMLSpanElement>, frame: TikzFrame) => {
-      if (event.button !== 0) return;
-      event.stopPropagation();
+  const beginFrameDrag = useCallback(
+    (event: ReactPointerEvent<HTMLElement>, frame: TikzFrame) => {
+      if (event.button !== 0 || multiTouchRef.current) return;
+      const current = selectedKeysRef.current;
+      if (event.shiftKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        viewportRef.current?.focus({ preventScroll: true });
+        toggleSelection(frame.key);
+        return;
+      }
+      if (current.length > 1 && current.includes(frame.key)) {
+        beginGroupMove(event, frame.key);
+        return;
+      }
       event.preventDefault();
-      event.currentTarget.setPointerCapture(event.pointerId);
+      event.stopPropagation();
+      viewportRef.current?.focus({ preventScroll: true });
       setIssuesOpen(false);
+      if (editingRef.current) closeEditor();
       selectOnly(frame.key);
-      frameMoveRef.current = {
-        source: sourceRef.current,
-        frame,
-        pointerId: event.pointerId,
-        startClientX: event.clientX,
-        startClientY: event.clientY,
-        startMinX: frame.minX,
-        startMinY: frame.minY,
-        startMaxX: frame.maxX,
-        startMaxY: frame.maxY,
-        moved: false,
+      guideTargetsRef.current = collectAlignmentTargets(
+        docRef.current,
+        new Set([frame.key]),
+      );
+      setAlignmentGuides(EMPTY_GUIDES);
+      const source = sourceRef.current;
+      const pointerId = event.pointerId;
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      const width = frame.maxX - frame.minX;
+      const height = frame.maxY - frame.minY;
+      let moved = false;
+
+      const handleMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
+        const deltaX = moveEvent.clientX - startClientX;
+        const deltaY = moveEvent.clientY - startClientY;
+        if (!moved && Math.hypot(deltaX, deltaY) < 2) return;
+        moved = true;
+        const cmPerPixel = 1 / (transformRef.current.zoom * PX_PER_CM);
+        let dx = deltaX * cmPerPixel;
+        let dy = -deltaY * cmPerPixel;
+        if (moveEvent.shiftKey) {
+          if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
+          else dx = 0;
+        }
+        const allowX = !moveEvent.shiftKey || dx !== 0;
+        const allowY = !moveEvent.shiftKey || dy !== 0;
+        const guide = findAlignmentSnap(
+          shiftedBounds(
+            {
+              minX: frame.minX,
+              minY: frame.minY,
+              maxX: frame.maxX,
+              maxY: frame.maxY,
+            },
+            dx,
+            dy,
+          ),
+          guideTargetsRef.current,
+          alignmentThreshold(
+            transformRef.current.zoom,
+            moveEvent.pointerType === "touch",
+          ),
+        );
+        const magnet = magnetRef.current && !moveEvent.altKey;
+        if (magnet && allowX && guide.snappedX) dx += guide.dx;
+        if (magnet && allowY && guide.snappedY) dy += guide.dy;
+        setAlignmentGuides(
+          moveEvent.altKey
+            ? EMPTY_GUIDES
+            : {
+                vertical: allowX ? guide.guides.vertical : [],
+                horizontal: allowY ? guide.guides.horizontal : [],
+              },
+        );
+        const step = moveEvent.altKey ? 0 : 0.1;
+        const minX =
+          magnet && allowX && guide.snappedX
+            ? frame.minX + dx
+            : snap(frame.minX + dx, step);
+        const minY =
+          magnet && allowY && guide.snappedY
+            ? frame.minY + dy
+            : snap(frame.minY + dy, step);
+        onSourceChange(
+          patchFrameGeometry(source, frame, {
+            minX,
+            minY,
+            maxX: minX + width,
+            maxY: minY + height,
+          }),
+        );
       };
+
+      const finish = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        setAlignmentGuides(EMPTY_GUIDES);
+      };
+
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
     },
-    [selectOnly],
+    [beginGroupMove, closeEditor, selectOnly, toggleSelection],
   );
 
-  const moveFrameMove = useCallback(
-    (event: ReactPointerEvent<HTMLSpanElement>) => {
-      const move = frameMoveRef.current;
-      if (!move || event.pointerId !== move.pointerId) return;
-      const deltaX = event.clientX - move.startClientX;
-      const deltaY = event.clientY - move.startClientY;
-      if (!move.moved && Math.hypot(deltaX, deltaY) < 2) return;
-      move.moved = true;
-      const cmPerPixel = 1 / (transform.zoom * PX_PER_CM);
-      let dx = deltaX * cmPerPixel;
-      let dy = -deltaY * cmPerPixel;
-      if (event.shiftKey) {
-        if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
-        else dx = 0;
+  const beginPathDrag = useCallback(
+    (event: ReactPointerEvent<HTMLElement>, path: TikzPath) => {
+      if (event.button !== 0 || multiTouchRef.current) return;
+      const current = selectedKeysRef.current;
+      if (current.length > 1 && current.includes(path.key)) {
+        beginGroupMove(event, path.key);
+        return;
       }
-      const step = event.altKey ? 0 : 0.1;
-      const width = move.startMaxX - move.startMinX;
-      const height = move.startMaxY - move.startMinY;
-      const minX = snap(move.startMinX + dx, step);
-      const minY = snap(move.startMinY + dy, step);
+      event.preventDefault();
+      event.stopPropagation();
+      viewportRef.current?.focus({ preventScroll: true });
+      setIssuesOpen(false);
+      if (editingRef.current) closeEditor();
+      selectOnly(path.key);
+      const bounds = pathBounds(path);
+      if (!bounds) return;
+      const freeEndpoints = pathEndpointHandles(path).filter(
+        (handle) => !handle.attached,
+      );
+      const objects: SelectionEditObjects = {
+        nodes: [],
+        labels: [],
+        frames: [],
+        paths: [path],
+      };
+      guideTargetsRef.current = collectAlignmentTargets(
+        docRef.current,
+        new Set([path.key]),
+      );
+      setAlignmentGuides(EMPTY_GUIDES);
+      setPathAttachHints([]);
+      const source = sourceRef.current;
+      const pointerId = event.pointerId;
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      let moved = false;
+      let lastSource = source;
+      let activeAttach: PathAttachCandidate | null = null;
+      let activeEndpoint: PathEndpointHandle | null = null;
+
+      const handleMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
+        const deltaX = moveEvent.clientX - startClientX;
+        const deltaY = moveEvent.clientY - startClientY;
+        if (!moved && Math.hypot(deltaX, deltaY) < 2) return;
+        moved = true;
+        const zoom = transformRef.current.zoom;
+        const cmPerPixel = 1 / (zoom * PX_PER_CM);
+        let dx = deltaX * cmPerPixel;
+        let dy = -deltaY * cmPerPixel;
+        if (moveEvent.shiftKey) {
+          if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
+          else dx = 0;
+        }
+        const allowX = !moveEvent.shiftKey || dx !== 0;
+        const allowY = !moveEvent.shiftKey || dy !== 0;
+        const magnet = magnetRef.current && !moveEvent.altKey;
+        const snappedPoints = freeEndpoints.map((handle) => ({
+          x: handle.point.x + dx,
+          y: handle.point.y + dy,
+        }));
+        const revealRadius =
+          ATTACH_REVEAL_PX / Math.max(0.05, zoom * PX_PER_CM);
+        const snapRadius =
+          (moveEvent.pointerType === "touch"
+            ? COARSE_ATTACH_SNAP_PX
+            : ATTACH_SNAP_PX) /
+          Math.max(0.05, zoom * PX_PER_CM);
+        const candidates = nearbyPathAnchors(
+          docRef.current,
+          snappedPoints,
+          revealRadius,
+        );
+
+        activeAttach = null;
+        activeEndpoint = null;
+        if (magnet) {
+          let bestDistance = snapRadius;
+          for (const handle of freeEndpoints) {
+            const point = {
+              x: handle.point.x + dx,
+              y: handle.point.y + dy,
+            };
+            for (const candidate of candidates) {
+              const anchorDx = candidate.point.x - point.x;
+              const anchorDy = candidate.point.y - point.y;
+              if (!allowX && Math.abs(anchorDx) > 0.002) continue;
+              if (!allowY && Math.abs(anchorDy) > 0.002) continue;
+              const distance = Math.hypot(anchorDx, anchorDy);
+              if (distance <= bestDistance) {
+                bestDistance = distance;
+                activeAttach = candidate;
+                activeEndpoint = handle;
+              }
+            }
+          }
+        }
+
+        let snappedX = false;
+        let snappedY = false;
+        if (activeAttach && activeEndpoint) {
+          dx = activeAttach.point.x - activeEndpoint.point.x;
+          dy = activeAttach.point.y - activeEndpoint.point.y;
+          setAlignmentGuides({
+            vertical: [activeAttach.point.x],
+            horizontal: [activeAttach.point.y],
+          });
+        } else {
+          const guide = findFeatureAlignmentSnap(
+            shiftedBounds(bounds, dx, dy),
+            snappedPoints,
+            guideTargetsRef.current,
+            alignmentThreshold(
+              zoom,
+              moveEvent.pointerType === "touch",
+            ),
+          );
+          snappedX = magnet && allowX && guide.snappedX;
+          snappedY = magnet && allowY && guide.snappedY;
+          if (snappedX) dx += guide.dx;
+          if (snappedY) dy += guide.dy;
+          setAlignmentGuides(
+            moveEvent.altKey
+              ? EMPTY_GUIDES
+              : {
+                  vertical: allowX ? guide.guides.vertical : [],
+                  horizontal: allowY ? guide.guides.horizontal : [],
+                },
+          );
+        }
+        setPathAttachHints(buildPathAttachHints(candidates, activeAttach));
+
+        const step = moveEvent.altKey ? 0 : 0.1;
+        const finalDx = activeAttach || snappedX ? dx : snap(dx, step);
+        const finalDy = activeAttach || snappedY ? dy : snap(dy, step);
+        lastSource = patchSelectionTranslation(source, objects, finalDx, finalDy);
+        onSourceChange(lastSource);
+      };
+
+      const finish = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        setAlignmentGuides(EMPTY_GUIDES);
+        setPathAttachHints([]);
+        if (upEvent.type === "pointercancel" || !activeAttach || !activeEndpoint) {
+          return;
+        }
+        const currentPath = parseTikz(lastSource).paths.find(
+          (item) => item.key === path.key,
+        );
+        if (!currentPath) return;
+        onSourceChange(
+          attachPathEndpoint(
+            lastSource,
+            currentPath,
+            activeEndpoint.subpathIndex,
+            activeEndpoint.edge,
+            activeAttach.node.name,
+            activeAttach.anchor,
+          ),
+        );
+      };
+
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [beginGroupMove, closeEditor, onSourceChange, selectOnly],
+  );
+
+  const startPathEndpointDrag = useCallback(
+    (
+      event: ReactPointerEvent<HTMLSpanElement>,
+      path: TikzPath,
+      handle: PathEndpointHandle,
+    ) => {
+      if (event.button !== 0 || multiTouchRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      viewportRef.current?.focus({ preventScroll: true });
+      setIssuesOpen(false);
+      if (editingRef.current) closeEditor();
+      guideTargetsRef.current = collectAlignmentTargets(
+        docRef.current,
+        new Set([path.key]),
+      );
+      setAlignmentGuides(EMPTY_GUIDES);
+      setPathAttachHints([]);
+      const source = sourceRef.current;
+      const pointerId = event.pointerId;
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      let moved = false;
+      let lastSource = source;
+      let activeAttach: PathAttachCandidate | null = null;
+
+      const handleMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
+        const deltaX = moveEvent.clientX - startClientX;
+        const deltaY = moveEvent.clientY - startClientY;
+        if (!moved && Math.hypot(deltaX, deltaY) < 1.5) return;
+        moved = true;
+        const zoom = transformRef.current.zoom;
+        const cmPerPixel = 1 / (zoom * PX_PER_CM);
+        let dx = deltaX * cmPerPixel;
+        let dy = -deltaY * cmPerPixel;
+        if (moveEvent.shiftKey) {
+          if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
+          else dx = 0;
+        }
+        const allowX = !moveEvent.shiftKey || dx !== 0;
+        const allowY = !moveEvent.shiftKey || dy !== 0;
+        const magnet = magnetRef.current && !moveEvent.altKey;
+        let point = { x: handle.point.x + dx, y: handle.point.y + dy };
+        const revealRadius =
+          ATTACH_REVEAL_PX / Math.max(0.05, zoom * PX_PER_CM);
+        const snapRadius =
+          (moveEvent.pointerType === "touch"
+            ? COARSE_ATTACH_SNAP_PX
+            : ATTACH_SNAP_PX) /
+          Math.max(0.05, zoom * PX_PER_CM);
+        const candidates = nearbyPathAnchors(
+          docRef.current,
+          [point],
+          revealRadius,
+        );
+        const compatible = candidates.filter((candidate) => {
+          const anchorDx = candidate.point.x - point.x;
+          const anchorDy = candidate.point.y - point.y;
+          return (
+            (allowX || Math.abs(anchorDx) <= 0.002) &&
+            (allowY || Math.abs(anchorDy) <= 0.002)
+          );
+        });
+        activeAttach = magnet
+          ? nearestPathAnchor(compatible, [point], snapRadius)
+          : null;
+
+        const step = moveEvent.altKey ? 0 : 0.05;
+        let guideSnappedX = false;
+        let guideSnappedY = false;
+        if (activeAttach) {
+          point = { ...activeAttach.point };
+          setAlignmentGuides({
+            vertical: [point.x],
+            horizontal: [point.y],
+          });
+        } else {
+          const guide = findFeatureAlignmentSnap(
+            { minX: point.x, minY: point.y, maxX: point.x, maxY: point.y },
+            [],
+            guideTargetsRef.current,
+            alignmentThreshold(zoom, moveEvent.pointerType === "touch"),
+          );
+          guideSnappedX = magnet && allowX && guide.snappedX;
+          guideSnappedY = magnet && allowY && guide.snappedY;
+          if (guideSnappedX) point.x += guide.dx;
+          if (guideSnappedY) point.y += guide.dy;
+          setAlignmentGuides(
+            moveEvent.altKey
+              ? EMPTY_GUIDES
+              : {
+                  vertical: allowX ? guide.guides.vertical : [],
+                  horizontal: allowY ? guide.guides.horizontal : [],
+                },
+          );
+          if (!guideSnappedX) point.x = snap(point.x, step);
+          if (!guideSnappedY) point.y = snap(point.y, step);
+        }
+        setPathAttachHints(buildPathAttachHints(candidates, activeAttach));
+        lastSource = patchPathEndpoint(
+          source,
+          path,
+          handle.subpathIndex,
+          handle.edge,
+          point,
+        );
+        onSourceChange(lastSource);
+      };
+
+      const finish = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        setAlignmentGuides(EMPTY_GUIDES);
+        setPathAttachHints([]);
+        if (upEvent.type === "pointercancel" || !activeAttach) return;
+        const currentPath = parseTikz(lastSource).paths.find(
+          (item) => item.key === path.key,
+        );
+        if (!currentPath) return;
+        onSourceChange(
+          attachPathEndpoint(
+            lastSource,
+            currentPath,
+            handle.subpathIndex,
+            handle.edge,
+            activeAttach.node.name,
+            activeAttach.anchor,
+          ),
+        );
+      };
+
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [closeEditor, onSourceChange],
+  );
+
+  const startCurveDrag = useCallback(
+    (
+      event: ReactPointerEvent<HTMLSpanElement>,
+      path: TikzPath,
+      handle: PathCurveHandle,
+    ) => {
+      if (event.button !== 0 || multiTouchRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      viewportRef.current?.focus({ preventScroll: true });
+      setIssuesOpen(false);
+      if (editingRef.current) closeEditor();
+      selectOnly(path.key);
+      setAlignmentGuides(EMPTY_GUIDES);
+      const source = sourceRef.current;
+      const pointerId = event.pointerId;
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      let moved = false;
+
+      const handleMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
+        const deltaX = moveEvent.clientX - startClientX;
+        const deltaY = moveEvent.clientY - startClientY;
+        if (!moved && Math.hypot(deltaX, deltaY) < 1.5) return;
+        moved = true;
+        const zoom = transformRef.current.zoom;
+        const cmPerPixel = 1 / (zoom * PX_PER_CM);
+        const dx = deltaX * cmPerPixel;
+        const dy = -deltaY * cmPerPixel;
+        const target = { x: handle.point.x + dx, y: handle.point.y + dy };
+        const offset =
+          (target.x - handle.chordMid.x) * handle.normal.x +
+          (target.y - handle.chordMid.y) * handle.normal.y;
+        const straightThreshold =
+          (moveEvent.pointerType === "touch" ? 13 : 7) /
+          Math.max(0.05, zoom * PX_PER_CM);
+        const magnet = magnetRef.current && !moveEvent.altKey;
+        if (magnet && Math.abs(offset) <= straightThreshold) {
+          onSourceChange(
+            patchPathSegmentCurve(
+              source,
+              path,
+              handle.subpathIndex,
+              handle.segmentIndex,
+              null,
+            ),
+          );
+          setAlignmentGuides(EMPTY_GUIDES);
+          return;
+        }
+        const scale = 4 / 3;
+        onSourceChange(
+          patchPathSegmentCurve(source, path, handle.subpathIndex, handle.segmentIndex, {
+            c1: {
+              x: handle.controls.c1.x + dx * scale,
+              y: handle.controls.c1.y + dy * scale,
+            },
+            c2: {
+              x: handle.controls.c2.x + dx * scale,
+              y: handle.controls.c2.y + dy * scale,
+            },
+          }),
+        );
+      };
+
+      const finish = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        setAlignmentGuides(EMPTY_GUIDES);
+      };
+
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [closeEditor, onSourceChange, selectOnly],
+  );
+
+  const straightenCurve = useCallback(
+    (path: TikzPath, handle: PathCurveHandle) => {
       onSourceChange(
-        patchFrameGeometry(move.source, move.frame, {
-          minX,
-          minY,
-          maxX: minX + width,
-          maxY: minY + height,
-        }),
+        patchPathSegmentCurve(
+          sourceRef.current,
+          path,
+          handle.subpathIndex,
+          handle.segmentIndex,
+          null,
+        ),
       );
     },
-    [onSourceChange, transform.zoom],
+    [onSourceChange],
   );
 
-  const endFrameMove = useCallback((event: ReactPointerEvent<HTMLSpanElement>) => {
-    const move = frameMoveRef.current;
-    if (!move || event.pointerId !== move.pointerId) return;
-    frameMoveRef.current = null;
-    try {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    } catch {
-      // The pointer may already have been released by the browser.
-    }
-  }, []);
+  const detachSelectedPath = useCallback(() => {
+    if (!selectedPath) return;
+    onSourceChange(detachPathEndpoints(sourceRef.current, selectedPath));
+  }, [onSourceChange, selectedPath]);
 
   const handleBackgroundPointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (event.button !== 0 && event.button !== 2) return;
+      if (event.button !== 0 && event.button !== 1 && event.button !== 2) return;
+      if (multiTouchRef.current) return;
       const target = event.target as HTMLElement;
       if (target.closest("[data-canvas-ui]")) return;
       const viewport = viewportRef.current;
       if (!viewport) return;
+      const focusCanvas = () => viewport.focus({ preventScroll: true });
 
-      if (event.button === 2) {
+      const wantsPan =
+        event.button === 1 ||
+        event.button === 2 ||
+        (event.button === 0 &&
+          (panToolRef.current || spacePanRef.current || previewRef.current != null));
+      if (wantsPan) {
         event.preventDefault();
+        focusCanvas();
         setIssuesOpen(false);
+        setAlignmentGuides(EMPTY_GUIDES);
         if (editing) closeEditor();
         autoFitRef.current = false;
         setPanning(true);
@@ -1521,10 +3421,10 @@ export function DiagramCanvas({
         const pointerId = event.pointerId;
         const startClientX = event.clientX;
         const startClientY = event.clientY;
-        const startX = transform.x;
-        const startY = transform.y;
+        const startX = transformRef.current.x;
+        const startY = transformRef.current.y;
         const handleMove = (moveEvent: PointerEvent) => {
-          if (moveEvent.pointerId !== pointerId) return;
+          if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
           setTransform((current) => ({
             ...current,
             x: startX + moveEvent.clientX - startClientX,
@@ -1549,11 +3449,164 @@ export function DiagramCanvas({
         return;
       }
 
+      const tool = shapeToolRef.current;
+      if (tool) {
+        event.preventDefault();
+        focusCanvas();
+        autoFitRef.current = false;
+        setIssuesOpen(false);
+        if (editing) closeEditor();
+        const rect = viewport.getBoundingClientRect();
+        const pointerId = event.pointerId;
+        const startClientX = event.clientX;
+        const startClientY = event.clientY;
+        const startTransform = transformRef.current;
+        const modelPoint = (clientX: number, clientY: number) => ({
+          x: (clientX - rect.left - startTransform.x) / (startTransform.zoom * PX_PER_CM),
+          y: -(clientY - rect.top - startTransform.y) / (startTransform.zoom * PX_PER_CM),
+        });
+        const startPoint = modelPoint(startClientX, startClientY);
+        const preset = DEFAULT_SHAPE_SIZE[tool];
+        let moved = false;
+        viewport.setPointerCapture(pointerId);
+        setShapeDraft({
+          kind: tool,
+          left: snap(startPoint.x - preset.width / 2, 0.1),
+          top: snap(startPoint.y - preset.height / 2, 0.1),
+          width: preset.width,
+          height: preset.height,
+        });
+
+        const draftBounds = (
+          endClientX: number,
+          endClientY: number,
+          altKey: boolean,
+        ): ShapeDraftState => {
+          const step = altKey ? 0 : 0.1;
+          const end = modelPoint(endClientX, endClientY);
+          const x0 = snap(startPoint.x, step);
+          const y0 = snap(startPoint.y, step);
+          const x1 = snap(end.x, step);
+          const y1 = snap(end.y, step);
+          let left = Math.min(x0, x1);
+          let top = Math.min(y0, y1);
+          let width = Math.abs(x1 - x0);
+          let height = Math.abs(y1 - y0);
+          if (tool === "circle") {
+            const size = Math.max(width, height);
+            if (x1 < x0) left = x0 - size;
+            if (y1 < y0) top = y0 - size;
+            width = size;
+            height = size;
+          }
+          return { kind: tool, left, top, width, height };
+        };
+
+        const handleMove = (moveEvent: PointerEvent) => {
+          if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
+          if (
+            !moved &&
+            Math.hypot(
+              moveEvent.clientX - startClientX,
+              moveEvent.clientY - startClientY,
+            ) < 4
+          ) {
+            return;
+          }
+          moved = true;
+          setShapeDraft(
+            draftBounds(moveEvent.clientX, moveEvent.clientY, moveEvent.altKey),
+          );
+        };
+
+        const finish = (upEvent: PointerEvent) => {
+          if (upEvent.pointerId !== pointerId) return;
+          viewport.removeEventListener("pointermove", handleMove);
+          viewport.removeEventListener("pointerup", finish);
+          viewport.removeEventListener("pointercancel", finish);
+          try {
+            viewport.releasePointerCapture(pointerId);
+          } catch {
+            // Ignore a pointer that the browser already released.
+          }
+          setShapeDraft(null);
+          if (upEvent.type === "pointercancel" || multiTouchRef.current) return;
+          const dragged =
+            moved &&
+            Math.hypot(
+              upEvent.clientX - startClientX,
+              upEvent.clientY - startClientY,
+            ) >= 8;
+          let bounds: ShapeDraftState;
+          if (dragged) {
+            const raw = draftBounds(
+              upEvent.clientX,
+              upEvent.clientY,
+              upEvent.altKey,
+            );
+            const width = Math.max(0.4, raw.width);
+            const height =
+              tool === "circle" ? width : Math.max(0.4, raw.height);
+            bounds = { ...raw, width, height };
+          } else {
+            const centerX = snap(startPoint.x, 0.1);
+            const centerY = snap(startPoint.y, 0.1);
+            bounds = {
+              kind: tool,
+              left: centerX - preset.width / 2,
+              top: centerY - preset.height / 2,
+              width: preset.width,
+              height: preset.height,
+            };
+          }
+          setShapeTool(null);
+          const result = insertShapeNode(sourceRef.current, docRef.current, {
+            kind: tool,
+            x: bounds.left + bounds.width / 2,
+            y: bounds.top + bounds.height / 2,
+            width: bounds.width,
+            height: bounds.height,
+            fill: "white",
+            draw: "black!75",
+          });
+          onSourceChange(result.source);
+          if (result.key) onSelect([result.key]);
+        };
+
+        viewport.addEventListener("pointermove", handleMove);
+        viewport.addEventListener("pointerup", finish);
+        viewport.addEventListener("pointercancel", finish);
+        return;
+      }
+
       if (target.closest(".tikz-node, .edge-label, .frame-overlay, .group-selection")) {
         return;
       }
 
+      const hitRect = viewport.getBoundingClientRect();
+      const hitTransform = transformRef.current;
+      const hitPoint = (clientX: number, clientY: number): Point => ({
+        x: (clientX - hitRect.left - hitTransform.x) / (hitTransform.zoom * PX_PER_CM),
+        y: -(clientY - hitRect.top - hitTransform.y) / (hitTransform.zoom * PX_PER_CM),
+      });
+      const pointerModel = hitPoint(event.clientX, event.clientY);
+      const edgeTolerance =
+        (event.pointerType === "touch" ? 14 : 7) /
+        Math.max(0.05, hitTransform.zoom * PX_PER_CM);
+      const edgeHit = findEdgeAtPoint(docRef.current, pointerModel, edgeTolerance);
+      if (edgeHit) {
+        if (event.shiftKey) {
+          event.preventDefault();
+          focusCanvas();
+          toggleSelection(edgeHit.key);
+          return;
+        }
+        beginPathDrag(event, edgeHit);
+        return;
+      }
+
       event.preventDefault();
+      focusCanvas();
       autoFitRef.current = false;
       setIssuesOpen(false);
       if (editing) closeEditor();
@@ -1573,7 +3626,7 @@ export function DiagramCanvas({
       });
 
       const handleMove = (moveEvent: PointerEvent) => {
-        if (moveEvent.pointerId !== pointerId) return;
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
         if (moveEvent.shiftKey) additive = true;
         if (!moved) {
           if (
@@ -1607,7 +3660,7 @@ export function DiagramCanvas({
           // Ignore a pointer that the browser already released.
         }
         setMarquee(null);
-        if (upEvent.type === "pointercancel") return;
+        if (upEvent.type === "pointercancel" || multiTouchRef.current) return;
 
         if (moved) {
           const topLeft = modelPoint(
@@ -1624,12 +3677,41 @@ export function DiagramCanvas({
             minY: bottomRight.y,
             maxY: topLeft.y,
           };
+          const filter = marqueeFilterRef.current;
           const hits: string[] = [];
-          for (const node of docRef.current.nodes) {
-            if (boundsIntersect(node.bounds, range)) hits.push(node.key);
+          if (filter.shapes) {
+            for (const node of docRef.current.nodes) {
+              if (boundsIntersect(node.bounds, range)) hits.push(node.key);
+            }
           }
-          for (const label of docRef.current.labels) {
-            if (boundsIntersect(label.bounds, range)) hits.push(label.key);
+          if (filter.labels) {
+            for (const label of docRef.current.labels) {
+              if (boundsIntersect(label.bounds, range)) hits.push(label.key);
+            }
+          }
+          if (filter.edges) {
+            for (const path of docRef.current.paths) {
+              if (isSelectableEdge(path) && pathIntersectsBounds(path, range)) {
+                hits.push(path.key);
+              }
+            }
+          }
+          if (filter.frames) {
+            for (const frame of docRef.current.frames) {
+              if (
+                boundsIntersect(
+                  {
+                    minX: frame.minX,
+                    minY: frame.minY,
+                    maxX: frame.maxX,
+                    maxY: frame.maxY,
+                  },
+                  range,
+                )
+              ) {
+                hits.push(frame.key);
+              }
+            }
           }
           onSelect(
             Array.from(
@@ -1640,18 +3722,7 @@ export function DiagramCanvas({
         }
 
         const point = modelPoint(upEvent.clientX, upEvent.clientY);
-        let hit: TikzFrame | null = null;
-        for (const frame of docRef.current.frames) {
-          if (
-            point.x < frame.minX ||
-            point.x > frame.maxX ||
-            point.y < frame.minY ||
-            point.y > frame.maxY
-          ) {
-            continue;
-          }
-          if (!hit || frame.width * frame.height < hit.width * hit.height) hit = frame;
-        }
+        const hit = findFrameAtPoint(docRef.current, point);
         if (additive || upEvent.shiftKey) {
           if (hit) toggleSelection(hit.key);
         } else {
@@ -1663,29 +3734,96 @@ export function DiagramCanvas({
       viewport.addEventListener("pointerup", finish);
       viewport.addEventListener("pointercancel", finish);
     },
-    [closeEditor, editing, onSelect, toggleSelection, transform],
+    [
+      beginFrameDrag,
+      beginPathDrag,
+      closeEditor,
+      editing,
+      onSelect,
+      onSourceChange,
+      toggleSelection,
+      transform,
+    ],
   );
 
   const nudgeSelection = useCallback(
-    (dxScreen: number, dyScreen: number) => {
+    (dx: number, dy: number) => {
       const objects = collectSelection(docRef.current, selectedKeysRef.current);
       if (selectionSize(objects) === 0) return;
-      const cmPerPixel = 1 / (transformRef.current.zoom * PX_PER_CM);
       onSourceChange(
-        patchSelectionTranslation(
-          sourceRef.current,
-          objects,
-          dxScreen * cmPerPixel,
-          dyScreen * cmPerPixel,
-        ),
+        patchSelectionTranslation(sourceRef.current, objects, dx, dy),
       );
     },
     [onSourceChange],
   );
 
+  const deleteSelection = useCallback(() => {
+    const objects = collectSelection(docRef.current, selectedKeysRef.current);
+    if (selectionSize(objects) === 0) return;
+    closeEditor();
+    onSelect([]);
+    onSourceChange(
+      deleteSelectionObjects(sourceRef.current, docRef.current, objects),
+    );
+  }, [closeEditor, onSelect, onSourceChange]);
+
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (editingRef.current || previewRef.current) return;
+      if (!selectedKeysRef.current.length) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.closest("input, textarea, select, [contenteditable='true'], .cm-editor")
+      ) {
+        return;
+      }
+      if (target?.isContentEditable) return;
+      event.preventDefault();
+      event.stopPropagation();
+      deleteSelection();
+    };
+    document.addEventListener("keydown", handleKey, true);
+    return () => document.removeEventListener("keydown", handleKey, true);
+  }, [deleteSelection]);
+
+  useEffect(() => {
+    const handleKey = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+      if (event.key.toLowerCase() !== "a") return;
       if (editingRef.current) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.closest(
+          "input, textarea, select, [contenteditable='true'], .cm-editor, [role='dialog'], .source-pane",
+        ) ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      const pane = viewportRef.current?.closest(".canvas-pane");
+      if (!pane || (pane as HTMLElement).offsetParent === null) return;
+      if (previewRef.current) return;
+      const current = docRef.current;
+      const keys = [
+        ...current.nodes.map((node) => node.key),
+        ...current.labels.map((label) => label.key),
+        ...current.paths.filter(isSelectableEdge).map((path) => path.key),
+        ...current.frames.map((frame) => frame.key),
+      ];
+      if (keys.length === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onSelect(keys);
+    };
+    document.addEventListener("keydown", handleKey, true);
+    return () => document.removeEventListener("keydown", handleKey, true);
+  }, [onSelect]);
+
+  useEffect(() => {
+    const handleKey = (event: KeyboardEvent) => {
+      if (editingRef.current || previewRef.current) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (!event.key.startsWith("Arrow")) return;
       if (!selectedKeysRef.current.length) return;
@@ -1696,7 +3834,7 @@ export function DiagramCanvas({
         return;
       }
       if (target?.isContentEditable) return;
-      const step = event.shiftKey ? 10 : 1;
+      const step = event.shiftKey ? 0.1 : 0.01;
       let dx = 0;
       let dy = 0;
       if (event.key === "ArrowLeft") dx = -step;
@@ -1751,7 +3889,9 @@ export function DiagramCanvas({
     backgroundPosition: `${transform.x}px ${transform.y}px, ${transform.x}px ${transform.y}px`,
   };
 
-  const empty = !doc.hasPicture || (doc.stats.nodes === 0 && doc.stats.paths === 0);
+  const empty = preview
+    ? false
+    : !doc.hasPicture || (doc.stats.nodes === 0 && doc.stats.paths === 0);
   const issueCount = doc.issues.length;
 
   const multiMeta = useMemo(() => {
@@ -1765,6 +3905,9 @@ export function DiagramCanvas({
     }
     if (selectionObjects.frames.length > 0) {
       counts.push(`${selectionObjects.frames.length} 底板`);
+    }
+    if (selectionObjects.paths.length > 0) {
+      counts.push(`${selectionObjects.paths.length} 连线`);
     }
     return [
       counts.join(" · "),
@@ -1808,21 +3951,41 @@ export function DiagramCanvas({
               ],
               editable: selectedLabel,
             }
-          : selectedFrame
+          : selectedPath
             ? {
-                eyebrow: selectedFrame.isBackground ? "背景板" : "矩形底板",
-                title: selectedFrame.isBackground ? "背景底板" : "矩形框",
+                eyebrow: "连线",
+                title: `路径 #${selectedPath.index + 1}`,
                 meta: [
-                  `${formatNumber(selectedFrame.width)} × ${formatNumber(selectedFrame.height)} cm`,
-                  `x ${formatNumber(selectedFrame.minX)} → ${formatNumber(selectedFrame.maxX)}`,
-                  `y ${formatNumber(selectedFrame.minY)} → ${formatNumber(selectedFrame.maxY)}`,
+                  selectedPath.style.dotted
+                    ? "点线"
+                    : selectedPath.style.dashed
+                      ? "虚线"
+                      : "实线",
+                  `${selectedPath.subpaths.reduce((total, subpath) => total + subpath.segments.length, 0)} 段`,
+                  `${formatNumber(pathLength(selectedPath))} cm`,
+                  selectedPath.style.arrowStart || selectedPath.style.arrowEnd
+                    ? "带箭头"
+                    : "无箭头",
                 ],
-                resizeHint: true,
+                path: selectedPath,
               }
-            : null;
+            : selectedFrame
+              ? {
+                  eyebrow: selectedFrame.isBackground ? "背景板" : "矩形底板",
+                  title: selectedFrame.isBackground ? "背景底板" : "矩形框",
+                  meta: [
+                    `${formatNumber(selectedFrame.width)} × ${formatNumber(selectedFrame.height)} cm`,
+                    `x ${formatNumber(selectedFrame.minX)} → ${formatNumber(selectedFrame.maxX)}`,
+                    `y ${formatNumber(selectedFrame.minY)} → ${formatNumber(selectedFrame.maxY)}`,
+                  ],
+                  resizeHint: true,
+                }
+              : null;
 
   return (
-    <section className={`canvas-pane${mobileActive ? " is-mobile-active" : ""}`}>
+    <section
+      className={`canvas-pane${mobileActive ? " is-mobile-active" : ""}${preview ? " is-exact-preview" : ""}`}
+    >
       <header className="pane-head canvas-head">
         <div className="pane-title">
           <span className="pane-index accent">02</span>
@@ -1833,7 +3996,12 @@ export function DiagramCanvas({
           </span>
         </div>
         <div className="pane-head-actions">
-          {issueCount > 0 ? (
+          {preview ? (
+            <span className="render-clean is-preview" title="由 TeX 预编译的精确矢量预览">
+              <Check size={13} />
+              {preview.packageName} 精确预览
+            </span>
+          ) : issueCount > 0 ? (
             <button
               type="button"
               className={`issue-toggle${issuesOpen ? " is-open" : ""}`}
@@ -1904,12 +4072,188 @@ export function DiagramCanvas({
 
       <div
         ref={viewportRef}
-        className={`diagram-viewport${panning ? " is-panning" : ""}`}
+        className={`diagram-viewport${panning ? " is-panning" : ""}${pinching ? " is-pinching" : ""}${shapeTool ? " is-shape-tool" : ""}${panTool || spacePan ? " is-pan-tool" : ""}${connectorDraft ? " is-connecting" : ""}`}
+        tabIndex={-1}
         onPointerDown={handleBackgroundPointerDown}
         onContextMenu={(event) => event.preventDefault()}
       >
         <div className="canvas-grid" style={gridStyle} aria-hidden="true" />
         <div className="canvas-grain" aria-hidden="true" />
+
+        <div
+          className="shape-toolbar"
+          data-canvas-ui="true"
+          role="toolbar"
+          aria-label="图形与连线工具"
+        >
+          <div className="shape-toolbar-group">
+            <button
+              type="button"
+              className={`shape-tool${shapeTool === null && !panTool ? " is-active" : ""}`}
+              aria-pressed={shapeTool === null && !panTool}
+              title="选择与移动"
+              onClick={() => activateShapeTool(null)}
+            >
+              <MousePointer2 size={15} />
+              <span>选择</span>
+            </button>
+            <button
+              type="button"
+              className={`shape-tool${panTool ? " is-active" : ""}`}
+              aria-pressed={panTool}
+              title="手形平移：左键拖动画布，或按住空格临时平移"
+              aria-label="手形平移工具"
+              onClick={togglePanTool}
+            >
+              <Hand size={15} />
+              <span>平移</span>
+            </button>
+          </div>
+          <span className="shape-toolbar-divider" aria-hidden="true" />
+          <div className="shape-toolbar-group">
+            {SHAPE_TOOLS.map((tool) => (
+              <button
+                key={tool.kind}
+                type="button"
+                className={`shape-tool${shapeTool === tool.kind ? " is-active" : ""}`}
+                aria-pressed={shapeTool === tool.kind}
+                title={tool.title}
+                onClick={() =>
+                  activateShapeTool(shapeTool === tool.kind ? null : tool.kind)
+                }
+              >
+                <ShapeToolIcon kind={tool.kind} />
+                <span>{tool.label}</span>
+              </button>
+            ))}
+          </div>
+          <span className="shape-toolbar-divider" aria-hidden="true" />
+          <div className="shape-toolbar-group">
+            <span className="shape-toolbar-label">连线</span>
+            <button
+              type="button"
+              className={`shape-tool${connectorArrow ? " is-active" : ""}`}
+              aria-pressed={connectorArrow}
+              title="新连线末端带箭头"
+              onClick={() => setConnectorArrow((value) => !value)}
+            >
+              <ArrowRight size={15} />
+              <span>箭头</span>
+            </button>
+            <button
+              type="button"
+              className={`shape-tool${connectorDashed ? " is-active" : ""}`}
+              aria-pressed={connectorDashed}
+              title="新连线使用虚线"
+              onClick={() => setConnectorDashed((value) => !value)}
+            >
+              <svg className="shape-tool-icon" viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M2.8 10h3.4M9 10h3.4M15.2 10h2" />
+              </svg>
+              <span>虚线</span>
+            </button>
+          </div>
+          <span className="shape-toolbar-divider" aria-hidden="true" />
+          <div className="shape-toolbar-group">
+            <button
+              type="button"
+              className={`shape-tool${magnetOn ? " is-active" : ""}`}
+              aria-pressed={magnetOn}
+              title={
+                magnetOn
+                  ? "磁吸吸附已开启：拖动时自动吸附对齐"
+                  : "磁吸吸附已关闭：拖动时不吸附，仍显示对齐参考线"
+              }
+              aria-label="磁吸对齐"
+              onClick={() => setMagnetOn((value) => !value)}
+            >
+              <Magnet size={15} />
+              <span>磁吸</span>
+            </button>
+          </div>
+          <span className="shape-toolbar-divider" aria-hidden="true" />
+          <div className="shape-toolbar-group">
+            <button
+              ref={marqueeButtonRef}
+              type="button"
+              className={`shape-tool marquee-filter-tool${marqueeMenuOpen ? " is-active" : ""}`}
+              aria-haspopup="menu"
+              aria-expanded={marqueeMenuOpen}
+              title="框选类型：选择左键框选包含的组件"
+              aria-label="框选类型"
+              onClick={toggleMarqueeMenu}
+            >
+              <span className="marquee-filter-icon">
+                <Layers size={15} />
+                <i className="shape-tool-count">
+                  {Object.values(marqueeFilter).filter(Boolean).length}
+                </i>
+              </span>
+              <span>框选</span>
+              <ChevronDown
+                size={11}
+                className={`marquee-filter-chevron${marqueeMenuOpen ? " is-open" : ""}`}
+              />
+            </button>
+          </div>
+        </div>
+
+        {marqueeMenuOpen ? (
+          <div
+            ref={marqueeMenuRef}
+            className="marquee-type-menu"
+            data-canvas-ui="true"
+            role="menu"
+            aria-label="框选类型"
+            style={{
+              left: `${marqueeMenuPos.left}px`,
+              top: `${marqueeMenuPos.top}px`,
+            }}
+          >
+            <div className="marquee-type-head">
+              <span>左键框选类型</span>
+              <small>可多选</small>
+            </div>
+            {MARQUEE_TYPES.map((item) => {
+              const enabled = marqueeFilter[item.kind];
+              return (
+                <button
+                  key={item.kind}
+                  type="button"
+                  role="menuitemcheckbox"
+                  aria-checked={enabled}
+                  className={`marquee-type-item${enabled ? " is-on" : ""}`}
+                  onClick={() =>
+                    setMarqueeFilter((current) => ({
+                      ...current,
+                      [item.kind]: !current[item.kind],
+                    }))
+                  }
+                >
+                  <span className="marquee-type-check" aria-hidden="true">
+                    {enabled ? <Check size={11} /> : null}
+                  </span>
+                  <span className="marquee-type-copy">
+                    <strong>{item.label}</strong>
+                    <small>{item.detail}</small>
+                  </span>
+                </button>
+              );
+            })}
+            <p className="marquee-type-foot">
+              关闭「背景」可避免框选时带上整块底板。
+            </p>
+          </div>
+        ) : null}
+
+        {shapeTool ? (
+          <div className="shape-tool-hint" data-canvas-ui="true">
+            <span className="shape-tool-hint-dot" aria-hidden="true" />
+            点击画布放置图形，或拖拽调整大小
+            <kbd>Esc</kbd>
+            退出
+          </div>
+        ) : null}
 
         <div
           ref={layerRef}
@@ -1918,11 +4262,45 @@ export function DiagramCanvas({
             transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.zoom})`,
           }}
         >
+          {preview ? (
+            <div
+              className="advanced-preview"
+              role="img"
+              aria-label={`${preview.name}：${preview.packageName} 精确矢量预览`}
+              style={{
+                left: `${(-preview.widthCm / 2) * PX_PER_CM}px`,
+                top: `${(-preview.heightCm / 2) * PX_PER_CM}px`,
+                width: `${preview.widthCm * PX_PER_CM}px`,
+                height: `${preview.heightCm * PX_PER_CM}px`,
+              }}
+              dangerouslySetInnerHTML={{ __html: preview.svg }}
+            />
+          ) : (
+            <>
           <svg className="edge-layer" width="1" height="1" aria-hidden="true">
             {doc.paths.map((path) => (
               <EdgePath key={path.key} path={path} />
             ))}
           </svg>
+
+          {selectedPath ? (
+            <svg
+              className="edge-selection-layer"
+              width="1"
+              height="1"
+              aria-hidden="true"
+            >
+              {selectedPath.subpaths.map((subpath, subpathIndex) =>
+                !subpath.shape && subpath.segments.length > 0 ? (
+                  <path
+                    key={`edge-selected-${subpathIndex}`}
+                    d={subpathPathData(subpath, false)}
+                    className="edge-selection-path"
+                  />
+                ) : null,
+              )}
+            </svg>
+          ) : null}
 
           {doc.nodes.map((node) => (
             <NodeView
@@ -1938,6 +4316,7 @@ export function DiagramCanvas({
               onResizeStart={startResize}
               onResizeMove={moveResize}
               onResizeEnd={endResize}
+              onAnchorPointerDown={startConnector}
             />
           ))}
 
@@ -1954,6 +4333,82 @@ export function DiagramCanvas({
             />
           ))}
 
+          {pathAttachNodes.map(({ node, active }) => (
+            <span
+              key={`path-attach-node-${node.key}`}
+              className={`path-attach-node${active ? " is-active" : ""}`}
+              style={{
+                left: `${screenX(node.bounds.minX)}px`,
+                top: `${screenY(node.bounds.maxY)}px`,
+                width: `${(node.bounds.maxX - node.bounds.minX) * PX_PER_CM}px`,
+                height: `${(node.bounds.maxY - node.bounds.minY) * PX_PER_CM}px`,
+              }}
+              aria-hidden="true"
+            />
+          ))}
+          {pathAttachHints.map((hint) => (
+            <span
+              key={`path-attach-${hint.node.key}-${hint.anchor}`}
+              className={`path-attach-anchor${hint.active ? " is-active" : ""}${hint.anchor === "center" ? " is-center" : ""}`}
+              style={{
+                left: `${screenX(hint.point.x)}px`,
+                top: `${screenY(hint.point.y)}px`,
+              }}
+              data-node={hint.node.name}
+              data-anchor={hint.anchor}
+              aria-hidden="true"
+            />
+          ))}
+
+          {selectedPath
+            ? selectedPathHandles.map((handle, index) => (
+                <span
+                  key={`path-handle-${handle.subpathIndex}-${handle.edge}-${index}`}
+                  className={`path-endpoint-handle${handle.attached ? " is-attached" : ""}`}
+                  style={{
+                    left: `${screenX(handle.point.x)}px`,
+                    top: `${screenY(handle.point.y)}px`,
+                  }}
+                  data-subpath={handle.subpathIndex}
+                  data-edge={handle.edge}
+                  title={
+                    handle.attached
+                      ? "端点连接节点，拖动后会从节点取下"
+                      : "拖动移动端点，靠近节点锚点松手可重新连接"
+                  }
+                  onPointerDown={(event) =>
+                    startPathEndpointDrag(event, selectedPath, handle)
+                  }
+                  onDoubleClick={(event) => event.stopPropagation()}
+                />
+              ))
+            : null}
+
+          {selectedPath
+            ? selectedCurveHandles.map((handle, index) => (
+                <span
+                  key={`path-curve-${handle.subpathIndex}-${handle.segmentIndex}-${index}`}
+                  className={`path-curve-handle${handle.bent ? " is-bent" : ""}`}
+                  style={{
+                    left: `${screenX(handle.point.x)}px`,
+                    top: `${screenY(handle.point.y)}px`,
+                  }}
+                  data-subpath={handle.subpathIndex}
+                  data-segment={handle.segmentIndex}
+                  title="拖动弯曲连线；靠近直线自动磁吸，双击恢复直线"
+                  onPointerDown={(event) =>
+                    startCurveDrag(event, selectedPath, handle)
+                  }
+                  onDoubleClick={(event) => {
+                    event.stopPropagation();
+                    straightenCurve(selectedPath, handle);
+                  }}
+                >
+                  <i aria-hidden="true" />
+                </span>
+              ))
+            : null}
+
           {selectedFrame ? (
             <div
               className="frame-overlay"
@@ -1969,24 +4424,19 @@ export function DiagramCanvas({
               <span
                 className="frame-badge"
                 title="拖拽移动底板"
-                onPointerDown={(event) => startFrameMove(event, selectedFrame)}
-                onPointerMove={moveFrameMove}
-                onPointerUp={endFrameMove}
-                onPointerCancel={endFrameMove}
+                onPointerDown={(event) => beginFrameDrag(event, selectedFrame)}
                 onDoubleClick={(event) => event.stopPropagation()}
                 onClick={(event) => event.stopPropagation()}
               >
                 {selectedFrame.isBackground ? "背景板" : "矩形底板"}
+                <span className="frame-badge-grip">⠿ 拖动移动</span>
               </span>
               {(["top", "right", "bottom", "left"] as const).map((edge) => (
                 <span
                   key={edge}
                   className={`frame-move-edge edge-${edge}`}
                   title="拖拽移动底板"
-                  onPointerDown={(event) => startFrameMove(event, selectedFrame)}
-                  onPointerMove={moveFrameMove}
-                  onPointerUp={endFrameMove}
-                  onPointerCancel={endFrameMove}
+                  onPointerDown={(event) => beginFrameDrag(event, selectedFrame)}
                   onDoubleClick={(event) => event.stopPropagation()}
                   onClick={(event) => event.stopPropagation()}
                 />
@@ -2053,7 +4503,116 @@ export function DiagramCanvas({
               ))}
             </div>
           ) : null}
+
+          {connectorTargetNode ? (
+            <span
+              className="connector-target-outline"
+              style={{
+                left: `${screenX(connectorTargetNode.bounds.minX)}px`,
+                top: `${screenY(connectorTargetNode.bounds.maxY)}px`,
+                width: `${(connectorTargetNode.bounds.maxX - connectorTargetNode.bounds.minX) * PX_PER_CM}px`,
+                height: `${(connectorTargetNode.bounds.maxY - connectorTargetNode.bounds.minY) * PX_PER_CM}px`,
+              }}
+              aria-hidden="true"
+            />
+          ) : null}
+
+          {connectorDraft ? (
+            <svg
+              className="connector-preview"
+              width="1"
+              height="1"
+              aria-hidden="true"
+            >
+              <defs>
+                <marker
+                  id="connector-preview-arrow"
+                  markerWidth="7"
+                  markerHeight="7"
+                  refX="6"
+                  refY="3.5"
+                  orient="auto"
+                >
+                  <path d="M0 0 7 3.5 0 7Z" fill="var(--accent)" />
+                </marker>
+              </defs>
+              <line
+                x1={screenX(connectorDraft.from.x)}
+                y1={screenY(connectorDraft.from.y)}
+                x2={screenX(connectorDraft.to.x)}
+                y2={screenY(connectorDraft.to.y)}
+                stroke="var(--accent)"
+                strokeWidth={2}
+                strokeDasharray={connectorDashed ? "7 5" : undefined}
+                markerEnd={
+                  connectorArrow ? "url(#connector-preview-arrow)" : undefined
+                }
+              />
+              <circle
+                cx={screenX(connectorDraft.from.x)}
+                cy={screenY(connectorDraft.from.y)}
+                r={3.5}
+                fill="var(--accent)"
+              />
+            </svg>
+          ) : null}
+
+          {shapeDraft ? (
+            <div
+              className="shape-draft"
+              style={{
+                left: `${screenX(shapeDraft.left)}px`,
+                top: `${screenY(shapeDraft.top + shapeDraft.height)}px`,
+                width: `${shapeDraft.width * PX_PER_CM}px`,
+                height: `${shapeDraft.height * PX_PER_CM}px`,
+              }}
+              aria-hidden="true"
+            >
+              <span className={`shape-draft-shape is-${shapeDraft.kind}`} />
+              <span className="shape-draft-size">
+                {formatNumber(shapeDraft.width)} × {formatNumber(shapeDraft.height)} cm
+              </span>
+            </div>
+          ) : null}
+            </>
+          )}
         </div>
+
+        {preview ? (
+          <div className="advanced-preview-note" data-canvas-ui="true">
+            <span className="advanced-preview-package">{preview.packageName}</span>
+            <span className="advanced-preview-copy">
+              <strong>{preview.name}</strong>
+              <small>{preview.description}</small>
+            </span>
+            <span className="advanced-preview-hint">
+              TeX 预编译矢量 · 拖动画布平移
+            </span>
+          </div>
+        ) : null}
+
+        {alignmentGuides.vertical.length > 0 || alignmentGuides.horizontal.length > 0 ? (
+          <div className="alignment-guides" aria-hidden="true">
+            {alignmentGuides.vertical.map((x) => (
+              <span
+                key={`guide-x-${x}`}
+                className="alignment-guide is-vertical"
+                style={{
+                  left: `${transform.x + x * PX_PER_CM * transform.zoom}px`,
+                }}
+              />
+            ))}
+            {alignmentGuides.horizontal.map((y) => (
+              <span
+                key={`guide-y-${y}`}
+                className="alignment-guide is-horizontal"
+                style={{
+                  top: `${transform.y - y * PX_PER_CM * transform.zoom}px`,
+                }}
+              />
+            ))}
+          </div>
+        ) : null}
 
         {marquee ? (
           <div
@@ -2077,28 +4636,14 @@ export function DiagramCanvas({
             <h3>{doc.hasPicture ? "这张图还没有元素" : "还没有 TikZ 图形"}</h3>
             <p>
               {doc.hasPicture
-                ? "在源码里添加 \\node、\\draw 或 \\path，右侧会立即出现图形。"
-                : "在左侧粘贴包含 \\begin{tikzpicture} … \\end{tikzpicture} 的源码，画布会自动渲染。"}
+                ? "用左上角图形工具直接绘制，或在源码里添加 \\node、\\draw 或 \\path。"
+                : "在左侧粘贴包含 \\begin{tikzpicture} … \\end{tikzpicture} 的源码，或用图形工具从空白开始。"}
             </p>
             <button type="button" className="button button-ink button-small" onClick={onLoadExample}>
               载入示例
             </button>
           </div>
         ) : null}
-
-        <div className="canvas-hint" data-canvas-ui="true">
-          <span>拖拽移动 / 双击改字</span>
-          <i />
-          <span>左键框选</span>
-          <i />
-          <span>Shift 多选</span>
-          <i />
-          <span>右键平移</span>
-          <i />
-          <span>方向键微调</span>
-          <i />
-          <span>滚轮缩放</span>
-        </div>
 
         <div className="zoom-cluster" data-canvas-ui="true">
           <button
@@ -2141,20 +4686,45 @@ export function DiagramCanvas({
         </div>
 
         {selectionInfo ? (
-          <aside className="selection-panel" data-canvas-ui="true">
+          selectionPanelCollapsed ? (
+            <button
+              type="button"
+              className="selection-panel-fab"
+              data-canvas-ui="true"
+              aria-label="展开属性面板"
+              aria-expanded="false"
+              title="展开属性面板"
+              onClick={() => setSelectionPanelCollapsed(false)}
+            >
+              <SlidersHorizontal size={14} />
+              <span>属性</span>
+            </button>
+          ) : (
+          <aside className="selection-panel" data-canvas-ui="true" aria-label="属性面板">
             <div className="selection-top">
               <span className="selection-eyebrow">{selectionInfo.eyebrow}</span>
-              <button
-                type="button"
-                className="selection-close"
-                aria-label="取消选择"
-                onClick={() => {
-                  closeEditor();
-                  onSelect([]);
-                }}
-              >
-                <X size={13} />
-              </button>
+              <div className="selection-top-actions">
+                <button
+                  type="button"
+                  className="selection-close selection-collapse"
+                  aria-label="收起属性面板"
+                  title="收起属性面板；点击其他组件时保持收起"
+                  onClick={() => setSelectionPanelCollapsed(true)}
+                >
+                  <ChevronDown size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="selection-close"
+                  aria-label="取消选择"
+                  onClick={() => {
+                    closeEditor();
+                    onSelect([]);
+                  }}
+                >
+                  <X size={13} />
+                </button>
+              </div>
             </div>
             <strong>{selectionInfo.title}</strong>
             <div className="selection-meta">
@@ -2162,6 +4732,100 @@ export function DiagramCanvas({
                 <span key={item}>{item}</span>
               ))}
             </div>
+            {selectedNode ? (
+              <div className="selection-colors">
+                <div className="selection-colors-head">
+                  <span>样式</span>
+                  <small>实时写入 TikZ</small>
+                </div>
+                <ColorControl
+                  label="填充"
+                  value={selectedNode.style.fill}
+                  allowNone
+                  onSessionStart={() => beginColorSession("node")}
+                  onPick={(value) => changeNodeColor("fill", value)}
+                  onNone={() =>
+                    changeNodeColor(
+                      "fill",
+                      selectedNode.style.fill ? null : "#ffffff",
+                    )
+                  }
+                />
+                <ColorControl
+                  label="描边"
+                  value={selectedNode.style.draw}
+                  allowNone
+                  onSessionStart={() => beginColorSession("node")}
+                  onPick={(value) => changeNodeColor("draw", value)}
+                  onNone={() =>
+                    changeNodeColor(
+                      "draw",
+                      selectedNode.style.draw ? null : "#20251f",
+                    )
+                  }
+                />
+                <ColorControl
+                  label="文字"
+                  value={selectedNode.style.textColor}
+                  fallback="#232820"
+                  onSessionStart={() => beginColorSession("node")}
+                  onPick={(value) => changeNodeColor("text", value)}
+                />
+                {selectedFontPoints !== null ? (
+                  <FontSizeControl
+                    points={selectedFontPoints}
+                    onStep={stepSelectedFontSize}
+                  />
+                ) : null}
+                <p className="selection-anchor-hint">
+                  <span className="selection-anchor-dot" aria-hidden="true" />
+                  拖拽八向锚点引出连线，移动图形时连线自动跟随
+                </p>
+              </div>
+            ) : selectedLabel ? (
+              <div className="selection-colors">
+                <div className="selection-colors-head">
+                  <span>样式</span>
+                  <small>实时写入 TikZ</small>
+                </div>
+                <ColorControl
+                  label="文字"
+                  value={selectedLabel.textColor}
+                  fallback="#3a4036"
+                  onSessionStart={() => beginColorSession("label")}
+                  onPick={changeLabelColor}
+                />
+                {selectedFontPoints !== null ? (
+                  <FontSizeControl
+                    points={selectedFontPoints}
+                    onStep={stepSelectedFontSize}
+                  />
+                ) : null}
+              </div>
+            ) : null}
+            {selectedPath ? (
+              <div className="selection-edge">
+                <p className="selection-edge-hint">
+                  <span
+                    className={`edge-endpoint-sample${pathHasAttachedEndpoints(selectedPath) ? " is-attached" : ""}`}
+                    aria-hidden="true"
+                  />
+                  <span>
+                    拖动端点可改变走向；拖到节点锚点时高亮吸附，松手即可重新连接。
+                  </span>
+                </p>
+                {pathHasAttachedEndpoints(selectedPath) ? (
+                  <button
+                    type="button"
+                    className="selection-detach"
+                    onClick={detachSelectedPath}
+                  >
+                    <Unlink size={13} />
+                    <span>从节点取下</span>
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
             {selectionInfo.editable ? (
               <button
                 type="button"
@@ -2176,16 +4840,29 @@ export function DiagramCanvas({
                 <span>
                   拖动任一组件移动全部，四角调整整体大小
                   <br />
-                  方向键微调 1px，Shift + 方向键 10px
+                  方向键微调 0.01cm，Shift + 方向键 0.1cm
                 </span>
               </p>
             ) : selectionInfo.resizeHint ? (
               <p className="selection-resize-hint">
                 <Scaling size={12} />
-                拖拽边框移动，四角调整大小
+                拖动选中框的边框或顶部标签移动，四角调整大小；框内拖动可继续框选
               </p>
             ) : null}
+            <div className="selection-actions">
+              <button
+                type="button"
+                className="selection-delete"
+                onClick={deleteSelection}
+                title="删除所选组件（Delete / Backspace）"
+              >
+                <Trash2 size={13} />
+                <span>删除所选</span>
+                <kbd>Del</kbd>
+              </button>
+            </div>
           </aside>
+          )
         ) : null}
 
         {editing ? (

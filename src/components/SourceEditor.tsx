@@ -120,6 +120,7 @@ interface SourceEditorProps {
   highlightKey?: string | null;
   active: boolean;
   resetSignal: number;
+  focusSignal: number;
 }
 
 export function SourceEditor({
@@ -129,6 +130,7 @@ export function SourceEditor({
   highlightKey,
   active,
   resetSignal,
+  focusSignal,
 }: SourceEditorProps) {
   const editorRef = useRef<ReactCodeMirrorRef>(null);
   const lastScrollKey = useRef<string | null>(null);
@@ -157,6 +159,11 @@ export function SourceEditor({
       selection: { anchor: 0 },
     });
   }, [resetSignal]);
+
+  useEffect(() => {
+    if (focusSignal === 0) return;
+    editorRef.current?.view?.focus();
+  }, [focusSignal]);
 
   useEffect(() => {
     if (!active) return;

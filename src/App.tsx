@@ -19,7 +19,8 @@ import {
   TIKZ_EXAMPLES,
 } from "@/src/lib/tikz/examples";
 import { parseTikz } from "@/src/lib/tikz/parser";
-import { getExactPreview } from "@/src/lib/tikz/previews";
+import { getExactPreview, previewSourceAnchor } from "@/src/lib/tikz/previews";
+import type { Span } from "@/src/lib/tikz/types";
 
 type ViewMode = "source" | "canvas";
 
@@ -59,6 +60,10 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("canvas");
+  const [sourceReveal, setSourceReveal] = useState<{
+    span: Span;
+    signal: number;
+  } | null>(null);
 
   const exampleWrapRef = useRef<HTMLDivElement>(null);
   const toastTimerRef = useRef<number | null>(null);
@@ -238,6 +243,16 @@ export default function App() {
     setToast(message);
     toastTimerRef.current = window.setTimeout(() => setToast(null), 2400);
   }, []);
+
+  const revealPreviewSource = useCallback(() => {
+    const span = previewSourceAnchor(sourceRef.current);
+    setSourceReveal((current) => ({
+      span,
+      signal: (current?.signal ?? 0) + 1,
+    }));
+    setViewMode("source");
+    showToast("已定位到对应源码");
+  }, [showToast]);
 
   const loadSource = useCallback(
     (next: string) => {
@@ -475,6 +490,8 @@ export default function App() {
             active={viewMode === "source"}
             resetSignal={resetSignal}
             focusSignal={sourceFocusSignal}
+            revealSpan={sourceReveal?.span ?? null}
+            revealSignal={sourceReveal?.signal ?? 0}
           />
 
           <footer className="source-foot">
@@ -518,6 +535,7 @@ export default function App() {
           onSourceChange={applySource}
           fitSignal={fitSignal}
           onLoadExample={() => loadSource(DEFAULT_TIKZ_SOURCE)}
+          onPreviewReveal={revealPreviewSource}
           mobileActive={viewMode === "canvas"}
         />
       </main>
@@ -624,6 +642,22 @@ export default function App() {
                   </span>
                 </div>
                 <div className="help-row">
+                  <span>弯曲连线 / 生成折线</span>
+                  <span className="help-keys">
+                    <kbd>拖动中点</kbd>
+                    <span>·</span>
+                    <kbd>属性面板切换</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>折线角度与直角吸附（90° 附近）</span>
+                  <span className="help-keys">
+                    <kbd>拖动折点</kbd>
+                    <span>/</span>
+                    <kbd>双击复原</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
                   <span>重新吸附到节点</span>
                   <span className="help-keys">
                     <kbd>靠近锚点或中心</kbd>
@@ -658,6 +692,12 @@ export default function App() {
                   <span>适应全部内容</span>
                   <span className="help-keys">
                     <kbd>左下角 · 适应</kbd>
+                  </span>
+                </div>
+                <div className="help-row">
+                  <span>预览示例定位源码</span>
+                  <span className="help-keys">
+                    <kbd>单击预览</kbd>
                   </span>
                 </div>
                 <div className="help-row">

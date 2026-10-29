@@ -1,5 +1,6 @@
 import type {
   Bounds,
+  PathSegment,
   Point,
   Span,
   TikzDocument,
@@ -354,7 +355,7 @@ function pathEndpointRefs(path: TikzPath): PathEndpointRef[] {
   return refs;
 }
 
-function isNumericCoordinate(raw: string | undefined): boolean {
+export function isNumericCoordinate(raw: string | undefined): boolean {
   if (!raw) return false;
   const parts = raw.split(",");
   if (parts.length !== 2) return false;
@@ -448,6 +449,66 @@ export function patchPathSegmentCurve(
       text,
     },
   ]);
+}
+
+function segmentConnectorText(source: string, segment: PathSegment | undefined): string {
+  if (!segment?.connectorSpan) return "";
+  return source.slice(segment.connectorSpan.start, segment.connectorSpan.end).trim();
+}
+
+export function patchPathSegmentPolyline(
+  source: string,
+  path: TikzPath,
+  subpathIndex: number,
+  segmentIndex: number,
+  corner: Point,
+): string {
+  const segment = path.subpaths[subpathIndex]?.segments[segmentIndex];
+  if (!segment?.connectorSpan) return source;
+  if (segmentConnectorText(source, segment) !== "--") return source;
+  return applySourceEdits(source, [
+    {
+      start: segment.connectorSpan.start,
+      end: segment.connectorSpan.end,
+      text: `-- (${formatTikzNumber(corner.x)}, ${formatTikzNumber(corner.y)}) --`,
+    },
+  ]);
+}
+
+export function patchPathVertex(
+  source: string,
+  path: TikzPath,
+  subpathIndex: number,
+  jointIndex: number,
+  point: Point,
+): string {
+  const subpath = path.subpaths[subpathIndex];
+  const previous = subpath?.segments[jointIndex];
+  const next = subpath?.segments[jointIndex + 1];
+  if (!previous || !next || !previous.raw.sourceSpan) return source;
+  if (segmentConnectorText(source, previous) !== "--") return source;
+  if (segmentConnectorText(source, next) !== "--") return source;
+  if (previous.raw.isRelative || !isNumericCoordinate(previous.raw.raw)) return source;
+  return applySourceEdits(source, [
+    endpointReplacement(source, previous.raw.sourceSpan, point),
+  ]);
+}
+
+export function straightenPathVertex(
+  source: string,
+  path: TikzPath,
+  subpathIndex: number,
+  jointIndex: number,
+): string {
+  const subpath = path.subpaths[subpathIndex];
+  const previous = subpath?.segments[jointIndex];
+  const next = subpath?.segments[jointIndex + 1];
+  if (!previous?.connectorSpan || !next?.connectorSpan) return source;
+  const start = previous.connectorSpan.start;
+  const end = next.connectorSpan.end;
+  const slice = source.slice(start, end);
+  if (!/^--\s*\([^()]*\)\s*--$/.test(slice)) return source;
+  return applySourceEdits(source, [{ start, end, text: "--" }]);
 }
 
 export function detachPathEndpoints(source: string, path: TikzPath): string {

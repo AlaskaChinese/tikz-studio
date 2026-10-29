@@ -121,6 +121,8 @@ interface SourceEditorProps {
   active: boolean;
   resetSignal: number;
   focusSignal: number;
+  revealSpan: Span | null;
+  revealSignal: number;
 }
 
 export function SourceEditor({
@@ -131,10 +133,13 @@ export function SourceEditor({
   active,
   resetSignal,
   focusSignal,
+  revealSpan,
+  revealSignal,
 }: SourceEditorProps) {
   const editorRef = useRef<ReactCodeMirrorRef>(null);
   const lastScrollKey = useRef<string | null>(null);
   const lastReset = useRef(resetSignal);
+  const lastReveal = useRef(0);
 
   useEffect(() => {
     const view = editorRef.current?.view;
@@ -164,6 +169,25 @@ export function SourceEditor({
     if (focusSignal === 0) return;
     editorRef.current?.view?.focus();
   }, [focusSignal]);
+
+  useEffect(() => {
+    if (!active || !revealSpan || revealSignal <= 0) return;
+    if (lastReveal.current === revealSignal) return;
+    lastReveal.current = revealSignal;
+    const frame = requestAnimationFrame(() => {
+      const view = editorRef.current?.view;
+      if (!view) return;
+      view.requestMeasure();
+      view.dispatch({
+        selection: { anchor: revealSpan.start, head: revealSpan.end },
+        effects: [
+          setSourceHighlight.of(revealSpan),
+          EditorView.scrollIntoView(revealSpan.start, { y: "center" }),
+        ],
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [active, revealSignal, revealSpan]);
 
   useEffect(() => {
     if (!active) return;

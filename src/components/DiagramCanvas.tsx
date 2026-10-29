@@ -40,7 +40,7 @@ import {
   type AlignmentGuides,
   type AlignmentTargets,
 } from "@/src/lib/tikz/alignment";
-import { cubicPoint, nodeAnchorPoint } from "@/src/lib/tikz/coordinates";
+import { borderPoint, cubicPoint, nodeAnchorPoint } from "@/src/lib/tikz/coordinates";
 import { latexToHtml } from "@/src/lib/tikz/latexText";
 import { PX_PER_CM } from "@/src/lib/tikz/options";
 import { parseTikz } from "@/src/lib/tikz/parser";
@@ -50,6 +50,7 @@ import {
   detachPathEndpoints,
   insertConnector,
   insertShapeNode,
+  isNumericCoordinate,
   patchFrameGeometry,
   patchLabelColor,
   patchLabelFontSize,
@@ -60,10 +61,13 @@ import {
   patchNodePosition,
   patchPathEndpoint,
   patchPathSegmentCurve,
+  patchPathSegmentPolyline,
+  patchPathVertex,
   patchSelectionScale,
   patchSelectionTranslation,
   patchText,
   pathHasAttachedEndpoints,
+  straightenPathVertex,
   validateNodeText,
   type BasicShapeKind,
   type SelectionEditObjects,
@@ -96,6 +100,8 @@ const COARSE_ALIGN_THRESHOLD_PX = 14;
 const ATTACH_REVEAL_PX = 96;
 const ATTACH_SNAP_PX = 16;
 const COARSE_ATTACH_SNAP_PX = 26;
+const RIGHT_ANGLE_SNAP_DEG = 7;
+const COARSE_RIGHT_ANGLE_SNAP_DEG = 12;
 
 type Corner = "nw" | "ne" | "sw" | "se";
 type ExportFormat = "svg" | "png" | "jpg";
@@ -236,7 +242,14 @@ interface PathEndpointHandle {
   attached: boolean;
 }
 
-interface PathCurveHandle {
+interface JointSnapContext {
+  from: Point;
+  to: Point;
+  fromNode: TikzNode | null;
+  toNode: TikzNode | null;
+}
+
+interface PathCurveHandle extends JointSnapContext {
   subpathIndex: number;
   segmentIndex: number;
   point: Point;
@@ -245,6 +258,16 @@ interface PathCurveHandle {
   controls: { c1: Point; c2: Point };
   bent: boolean;
 }
+
+interface PathVertexHandle extends JointSnapContext {
+  subpathIndex: number;
+  segmentIndex: number;
+  point: Point;
+  angle: number;
+  rightAngle: boolean;
+}
+
+type BendMode = "curve" | "polyline";
 
 interface CurveDragState {
   source: string;
@@ -305,6 +328,7 @@ interface DiagramCanvasProps {
   onSourceChange: (source: string) => void;
   fitSignal: number;
   onLoadExample: () => void;
+  onPreviewReveal: () => void;
   mobileActive: boolean;
 }
 
@@ -628,8 +652,142 @@ function pathCurveHandles(path: TikzPath, source: string): PathCurveHandle[] {
         normal,
         controls,
         bent: "c1" in segment.geometry || Math.abs(offset) > 0.02,
+        from,
+        to,
+        fromNode: segment.from.isBorderPoint ? segment.from.nodeRef ?? null : null,
+        toNode: segment.to.isBorderPoint ? segment.to.nodeRef ?? null : null,
       });
     });
+  });
+  return handles;
+}
+
+function segmentConnectorText(source: string, segment: PathSegment): string {
+  if (!segment.connectorSpan) return "";
+  return source.slice(segment.connectorSpan.start, segment.connectorSpan.end).trim();
+}
+
+function lineAngleDegrees(from: Point, joint: Point, to: Point): number {
+  const ax = from.x - joint.x;
+  const ay = from.y - joint.y;
+  const bx = to.x - joint.x;
+  const by = to.y - joint.y;
+  const lengthA = Math.hypot(ax, ay);
+  const lengthB = Math.hypot(bx, by);
+  if (lengthA < 1e-6 || lengthB < 1e-6) return 180;
+  const cosine = (ax * bx + ay * by) / (lengthA * lengthB);
+  return (Math.acos(Math.min(1, Math.max(-1, cosine))) * 180) / Math.PI;
+}
+
+function rightAnglePoint(from: Point, to: Point, target: Point): Point | null {
+  const radius = Math.hypot(to.x - from.x, to.y - from.y) / 2;
+  if (radius < 0.05) return null;
+  const center = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
+  const dx = target.x - center.x;
+  const dy = target.y - center.y;
+  const distance = Math.hypot(dx, dy);
+  if (distance < 1e-4) return null;
+  return {
+    x: center.x + (dx / distance) * radius,
+    y: center.y + (dy / distance) * radius,
+  };
+}
+
+function jointEndpoint(node: TikzNode | null, fallback: Point, joint: Point): Point {
+  return node ? borderPoint(node, joint) : fallback;
+}
+
+function jointAngleDegrees(context: JointSnapContext, joint: Point): number {
+  return lineAngleDegrees(
+    jointEndpoint(context.fromNode, context.from, joint),
+    joint,
+    jointEndpoint(context.toNode, context.to, joint),
+  );
+}
+
+function rightAngleJoint(context: JointSnapContext, joint: Point): Point {
+  let point = joint;
+  for (let iteration = 0; iteration < 4; iteration += 1) {
+    const from = jointEndpoint(context.fromNode, context.from, point);
+    const to = jointEndpoint(context.toNode, context.to, point);
+    const snapped = rightAnglePoint(from, to, point);
+    if (!snapped) return point;
+    if (Math.hypot(snapped.x - point.x, snapped.y - point.y) < 1e-4) return snapped;
+    point = snapped;
+  }
+  return point;
+}
+
+function pathPolylineHandles(path: TikzPath, source: string): PathCurveHandle[] {
+  if (path.generated) return [];
+  const handles: PathCurveHandle[] = [];
+  path.subpaths.forEach((subpath, subpathIndex) => {
+    if (subpath.shape || subpath.generated) return;
+    subpath.segments.forEach((segment, segmentIndex) => {
+      if (segment.generated || segment.kind !== "line" || !segment.connectorSpan) return;
+      if (segmentConnectorText(source, segment) !== "--") return;
+      const from = segment.geometry.from;
+      const to = segment.geometry.to;
+      const length = Math.hypot(to.x - from.x, to.y - from.y);
+      if (length < 0.25) return;
+      const chordMid = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
+      handles.push({
+        subpathIndex,
+        segmentIndex,
+        point: chordMid,
+        chordMid,
+        normal: { x: -(to.y - from.y) / length, y: (to.x - from.x) / length },
+        controls: {
+          c1: { x: from.x + (to.x - from.x) / 3, y: from.y + (to.y - from.y) / 3 },
+          c2: {
+            x: from.x + ((to.x - from.x) * 2) / 3,
+            y: from.y + ((to.y - from.y) * 2) / 3,
+          },
+        },
+        bent: false,
+        from,
+        to,
+        fromNode: segment.from.isBorderPoint ? segment.from.nodeRef ?? null : null,
+        toNode: segment.to.isBorderPoint ? segment.to.nodeRef ?? null : null,
+      });
+    });
+  });
+  return handles;
+}
+
+function pathVertexHandles(path: TikzPath, source: string): PathVertexHandle[] {
+  if (path.generated) return [];
+  const handles: PathVertexHandle[] = [];
+  path.subpaths.forEach((subpath, subpathIndex) => {
+    if (subpath.shape || subpath.generated || subpath.segments.length < 2) return;
+    for (let index = 1; index < subpath.segments.length; index += 1) {
+      const previous = subpath.segments[index - 1];
+      const next = subpath.segments[index];
+      if (previous.generated || next.generated) continue;
+      if ("c1" in previous.geometry || "c1" in next.geometry) continue;
+      if (segmentConnectorText(source, previous) !== "--") continue;
+      if (segmentConnectorText(source, next) !== "--") continue;
+      if (previous.raw.isRelative || !previous.raw.sourceSpan) continue;
+      if (!isNumericCoordinate(previous.raw.raw)) continue;
+      const from = previous.geometry.from;
+      const to = next.geometry.to;
+      const joint = next.geometry.from;
+      if (Math.hypot(from.x - joint.x, from.y - joint.y) < 0.05) continue;
+      if (Math.hypot(to.x - joint.x, to.y - joint.y) < 0.05) continue;
+      const angle = lineAngleDegrees(from, joint, to);
+      if (angle <= 1 || angle >= 179) continue;
+      handles.push({
+        subpathIndex,
+        segmentIndex: index - 1,
+        point: joint,
+        from,
+        to,
+        fromNode: previous.from.isBorderPoint ? previous.from.nodeRef ?? null : null,
+        toNode: next.to.isBorderPoint ? next.to.nodeRef ?? null : null,
+        angle,
+        rightAngle: Math.abs(angle - 90) <= 0.5,
+      });
+    }
   });
   return handles;
 }
@@ -1386,6 +1544,7 @@ export function DiagramCanvas({
   onSourceChange,
   fitSignal,
   onLoadExample,
+  onPreviewReveal,
   mobileActive,
 }: DiagramCanvasProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -1435,6 +1594,7 @@ export function DiagramCanvas({
   const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuides>(EMPTY_GUIDES);
   const [pathAttachHints, setPathAttachHints] = useState<PathAttachHint[]>([]);
   const [selectionPanelCollapsed, setSelectionPanelCollapsed] = useState(false);
+  const [bendMode, setBendMode] = useState<BendMode>("curve");
   const [connectorDraft, setConnectorDraft] = useState<ConnectorDraftState | null>(null);
   const [connectorArrow, setConnectorArrow] = useState(true);
   const [connectorDashed, setConnectorDashed] = useState(false);
@@ -1501,6 +1661,17 @@ export function DiagramCanvas({
   );
   const selectedCurveHandles = useMemo(
     () => (selectedPath ? pathCurveHandles(selectedPath, source) : []),
+    [selectedPath, source],
+  );
+  const selectedPolylineHandles = useMemo(
+    () =>
+      selectedPath && bendMode === "polyline"
+        ? pathPolylineHandles(selectedPath, source)
+        : [],
+    [bendMode, selectedPath, source],
+  );
+  const selectedVertexHandles = useMemo(
+    () => (selectedPath ? pathVertexHandles(selectedPath, source) : []),
     [selectedPath, source],
   );
   const pathAttachNodes = useMemo(() => {
@@ -3389,6 +3560,167 @@ export function DiagramCanvas({
     [onSourceChange],
   );
 
+  const startPolylineDrag = useCallback(
+    (
+      event: ReactPointerEvent<HTMLSpanElement>,
+      path: TikzPath,
+      handle: PathCurveHandle,
+    ) => {
+      if (event.button !== 0 || multiTouchRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      viewportRef.current?.focus({ preventScroll: true });
+      setIssuesOpen(false);
+      if (editingRef.current) closeEditor();
+      selectOnly(path.key);
+      setAlignmentGuides(EMPTY_GUIDES);
+      const source = sourceRef.current;
+      const pointerId = event.pointerId;
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      let moved = false;
+
+      const handleMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
+        const deltaX = moveEvent.clientX - startClientX;
+        const deltaY = moveEvent.clientY - startClientY;
+        if (!moved && Math.hypot(deltaX, deltaY) < 1.5) return;
+        moved = true;
+        const zoom = transformRef.current.zoom;
+        const cmPerPixel = 1 / (zoom * PX_PER_CM);
+        const dx = deltaX * cmPerPixel;
+        const dy = -deltaY * cmPerPixel;
+        let point = { x: handle.chordMid.x + dx, y: handle.chordMid.y + dy };
+        const offset =
+          (point.x - handle.chordMid.x) * handle.normal.x +
+          (point.y - handle.chordMid.y) * handle.normal.y;
+        const straightThreshold =
+          (moveEvent.pointerType === "touch" ? 13 : 7) /
+          Math.max(0.05, zoom * PX_PER_CM);
+        if (Math.abs(offset) <= straightThreshold) return;
+        const step = moveEvent.altKey ? 0 : 0.05;
+        point = { x: snap(point.x, step), y: snap(point.y, step) };
+        const magnet = magnetRef.current && !moveEvent.altKey;
+        if (magnet) {
+          const angle = jointAngleDegrees(handle, point);
+          const threshold =
+            moveEvent.pointerType === "touch"
+              ? COARSE_RIGHT_ANGLE_SNAP_DEG
+              : RIGHT_ANGLE_SNAP_DEG;
+          if (Math.abs(angle - 90) <= threshold) {
+            point = rightAngleJoint(handle, point);
+          }
+        }
+        onSourceChange(
+          patchPathSegmentPolyline(
+            source,
+            path,
+            handle.subpathIndex,
+            handle.segmentIndex,
+            point,
+          ),
+        );
+      };
+
+      const finish = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        setAlignmentGuides(EMPTY_GUIDES);
+      };
+
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [closeEditor, onSourceChange, selectOnly],
+  );
+
+  const startVertexDrag = useCallback(
+    (
+      event: ReactPointerEvent<HTMLSpanElement>,
+      path: TikzPath,
+      vertex: PathVertexHandle,
+    ) => {
+      if (event.button !== 0 || multiTouchRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      viewportRef.current?.focus({ preventScroll: true });
+      setIssuesOpen(false);
+      if (editingRef.current) closeEditor();
+      selectOnly(path.key);
+      setAlignmentGuides(EMPTY_GUIDES);
+      const source = sourceRef.current;
+      const pointerId = event.pointerId;
+      const startClientX = event.clientX;
+      const startClientY = event.clientY;
+      let moved = false;
+
+      const handleMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
+        const deltaX = moveEvent.clientX - startClientX;
+        const deltaY = moveEvent.clientY - startClientY;
+        if (!moved && Math.hypot(deltaX, deltaY) < 1.5) return;
+        moved = true;
+        const zoom = transformRef.current.zoom;
+        const cmPerPixel = 1 / (zoom * PX_PER_CM);
+        const dx = deltaX * cmPerPixel;
+        const dy = -deltaY * cmPerPixel;
+        let point = { x: vertex.point.x + dx, y: vertex.point.y + dy };
+        const step = moveEvent.altKey ? 0 : 0.05;
+        point = { x: snap(point.x, step), y: snap(point.y, step) };
+        const magnet = magnetRef.current && !moveEvent.altKey;
+        if (magnet) {
+          const angle = jointAngleDegrees(vertex, point);
+          const threshold =
+            moveEvent.pointerType === "touch"
+              ? COARSE_RIGHT_ANGLE_SNAP_DEG
+              : RIGHT_ANGLE_SNAP_DEG;
+          if (Math.abs(angle - 90) <= threshold) {
+            point = rightAngleJoint(vertex, point);
+          }
+        }
+        onSourceChange(
+          patchPathVertex(
+            source,
+            path,
+            vertex.subpathIndex,
+            vertex.segmentIndex,
+            point,
+          ),
+        );
+      };
+
+      const finish = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        setAlignmentGuides(EMPTY_GUIDES);
+      };
+
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [closeEditor, onSourceChange, selectOnly],
+  );
+
+  const straightenVertex = useCallback(
+    (path: TikzPath, vertex: PathVertexHandle) => {
+      onSourceChange(
+        straightenPathVertex(
+          sourceRef.current,
+          path,
+          vertex.subpathIndex,
+          vertex.segmentIndex,
+        ),
+      );
+    },
+    [onSourceChange],
+  );
+
   const detachSelectedPath = useCallback(() => {
     if (!selectedPath) return;
     onSourceChange(detachPathEndpoints(sourceRef.current, selectedPath));
@@ -3423,8 +3755,24 @@ export function DiagramCanvas({
         const startClientY = event.clientY;
         const startX = transformRef.current.x;
         const startY = transformRef.current.y;
+        const previewSpec = previewRef.current;
+        const previewTarget = Boolean(
+          previewSpec &&
+            (event.target as Element).closest?.(".advanced-preview"),
+        );
+        let moved = false;
         const handleMove = (moveEvent: PointerEvent) => {
           if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
+          if (
+            !moved &&
+            Math.hypot(
+              moveEvent.clientX - startClientX,
+              moveEvent.clientY - startClientY,
+            ) < 4
+          ) {
+            return;
+          }
+          moved = true;
           setTransform((current) => ({
             ...current,
             x: startX + moveEvent.clientX - startClientX,
@@ -3441,6 +3789,16 @@ export function DiagramCanvas({
             viewport.releasePointerCapture(pointerId);
           } catch {
             // Ignore a pointer that the browser already released.
+          }
+          if (
+            upEvent.type === "pointerup" &&
+            event.button === 0 &&
+            previewSpec &&
+            previewTarget &&
+            !moved &&
+            !multiTouchRef.current
+          ) {
+            onPreviewReveal();
           }
         };
         viewport.addEventListener("pointermove", handleMove);
@@ -3739,6 +4097,7 @@ export function DiagramCanvas({
       beginPathDrag,
       closeEditor,
       editing,
+      onPreviewReveal,
       onSelect,
       onSourceChange,
       toggleSelection,
@@ -4266,6 +4625,7 @@ export function DiagramCanvas({
             <div
               className="advanced-preview"
               role="img"
+              title="单击定位到源码；拖动平移画布"
               aria-label={`${preview.name}：${preview.packageName} 精确矢量预览`}
               style={{
                 left: `${(-preview.widthCm / 2) * PX_PER_CM}px`,
@@ -4385,26 +4745,78 @@ export function DiagramCanvas({
             : null}
 
           {selectedPath
-            ? selectedCurveHandles.map((handle, index) => (
+            ? bendMode === "curve"
+              ? selectedCurveHandles.map((handle, index) => (
+                  <span
+                    key={`path-curve-${handle.subpathIndex}-${handle.segmentIndex}-${index}`}
+                    className={`path-curve-handle${handle.bent ? " is-bent" : ""}`}
+                    style={{
+                      left: `${screenX(handle.point.x)}px`,
+                      top: `${screenY(handle.point.y)}px`,
+                    }}
+                    data-subpath={handle.subpathIndex}
+                    data-segment={handle.segmentIndex}
+                    title="拖动弯曲连线；靠近直线自动磁吸，双击恢复直线"
+                    onPointerDown={(event) =>
+                      startCurveDrag(event, selectedPath, handle)
+                    }
+                    onDoubleClick={(event) => {
+                      event.stopPropagation();
+                      straightenCurve(selectedPath, handle);
+                    }}
+                  >
+                    <i aria-hidden="true" />
+                  </span>
+                ))
+              : selectedPolylineHandles.map((handle, index) => (
+                  <span
+                    key={`path-polyline-${handle.subpathIndex}-${handle.segmentIndex}-${index}`}
+                    className="path-curve-handle is-polyline"
+                    style={{
+                      left: `${screenX(handle.point.x)}px`,
+                      top: `${screenY(handle.point.y)}px`,
+                    }}
+                    data-subpath={handle.subpathIndex}
+                    data-segment={handle.segmentIndex}
+                    data-bend="polyline"
+                    title="拖动生成折点；实时显示角度，靠近 90° 自动吸附"
+                    onPointerDown={(event) =>
+                      startPolylineDrag(event, selectedPath, handle)
+                    }
+                    onDoubleClick={(event) => event.stopPropagation()}
+                  >
+                    <i aria-hidden="true" />
+                  </span>
+                ))
+            : null}
+
+          {selectedPath
+            ? selectedVertexHandles.map((vertex, index) => (
                 <span
-                  key={`path-curve-${handle.subpathIndex}-${handle.segmentIndex}-${index}`}
-                  className={`path-curve-handle${handle.bent ? " is-bent" : ""}`}
+                  key={`path-vertex-${vertex.subpathIndex}-${vertex.segmentIndex}-${index}`}
+                  className={`path-vertex-handle${vertex.rightAngle ? " is-right" : ""}`}
                   style={{
-                    left: `${screenX(handle.point.x)}px`,
-                    top: `${screenY(handle.point.y)}px`,
+                    left: `${screenX(vertex.point.x)}px`,
+                    top: `${screenY(vertex.point.y)}px`,
                   }}
-                  data-subpath={handle.subpathIndex}
-                  data-segment={handle.segmentIndex}
-                  title="拖动弯曲连线；靠近直线自动磁吸，双击恢复直线"
+                  data-subpath={vertex.subpathIndex}
+                  data-segment={vertex.segmentIndex}
+                  data-angle={vertex.angle.toFixed(1)}
+                  title="拖动折点调整角度，靠近 90° 自动吸附；双击恢复直线"
                   onPointerDown={(event) =>
-                    startCurveDrag(event, selectedPath, handle)
+                    startVertexDrag(event, selectedPath, vertex)
                   }
                   onDoubleClick={(event) => {
                     event.stopPropagation();
-                    straightenCurve(selectedPath, handle);
+                    straightenVertex(selectedPath, vertex);
                   }}
                 >
-                  <i aria-hidden="true" />
+                  <span
+                    className={`path-angle-badge${vertex.rightAngle ? " is-right" : ""}`}
+                    aria-hidden="true"
+                  >
+                    {Math.round(vertex.angle)}°
+                  </span>
                 </span>
               ))
             : null}
@@ -4586,7 +4998,7 @@ export function DiagramCanvas({
               <small>{preview.description}</small>
             </span>
             <span className="advanced-preview-hint">
-              TeX 预编译矢量 · 拖动画布平移
+              单击定位源码 · 拖动平移
             </span>
           </div>
         ) : null}
@@ -4813,6 +5225,36 @@ export function DiagramCanvas({
                   <span>
                     拖动端点可改变走向；拖到节点锚点时高亮吸附，松手即可重新连接。
                   </span>
+                </p>
+                <div className="selection-bend">
+                  <span className="selection-bend-label">中点拖动</span>
+                  <div
+                    className="selection-bend-switch"
+                    role="group"
+                    aria-label="连线中点拖动方式"
+                  >
+                    <button
+                      type="button"
+                      className={bendMode === "curve" ? "is-active" : ""}
+                      aria-pressed={bendMode === "curve"}
+                      onClick={() => setBendMode("curve")}
+                    >
+                      弧线
+                    </button>
+                    <button
+                      type="button"
+                      className={bendMode === "polyline" ? "is-active" : ""}
+                      aria-pressed={bendMode === "polyline"}
+                      onClick={() => setBendMode("polyline")}
+                    >
+                      折线
+                    </button>
+                  </div>
+                </div>
+                <p className="selection-bend-hint">
+                  {bendMode === "curve"
+                    ? "拖动中点弯曲，靠近直线自动磁吸；双击中点复原。"
+                    : "拖动中点生成折点，实时显示角度；接近 90° 吸附直角，双击折点复原。"}
                 </p>
                 {pathHasAttachedEndpoints(selectedPath) ? (
                   <button

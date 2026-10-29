@@ -4,7 +4,7 @@ import tikzcdSvg from "@/src/assets/previews/tikzcd.svg?raw";
 import lactamSvg from "@/src/assets/previews/lactam.svg?raw";
 import cageSvg from "@/src/assets/previews/cage.svg?raw";
 import { TIKZ_EXAMPLES, type TikzExample } from "./examples";
-import type { Bounds } from "./types";
+import type { Bounds, Span } from "./types";
 
 export type PreviewKind = NonNullable<TikzExample["preview"]>;
 
@@ -108,5 +108,26 @@ export function previewBounds(preview: PreviewSpec): Bounds {
     minY: -preview.heightCm / 2,
     maxX: preview.widthCm / 2,
     maxY: preview.heightCm / 2,
+  };
+}
+
+export function previewSourceAnchor(source: string): Span {
+  const documentStart = source.indexOf("\\begin{document}");
+  const searchFrom =
+    documentStart >= 0 ? documentStart + "\\begin{document}".length : 0;
+  const environment = /\\begin\s*\{[^}\n]+\}/g;
+  environment.lastIndex = searchFrom;
+  const match = environment.exec(source);
+  if (match) {
+    return { start: match.index, end: match.index + match[0].length };
+  }
+  const line = /[^\s][^\n]*/g;
+  line.lastIndex = searchFrom;
+  const fallback = line.exec(source);
+  if (!fallback) return { start: 0, end: 0 };
+  const token = fallback[0].match(/^\S+/)?.[0] ?? fallback[0];
+  return {
+    start: fallback.index,
+    end: fallback.index + Math.min(token.length, 48),
   };
 }

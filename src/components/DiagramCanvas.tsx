@@ -23,8 +23,10 @@ import {
   Minus,
   MousePointer2,
   Plus,
+  RefreshCw,
   Scaling,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
   TriangleAlert,
   Unlink,
@@ -81,6 +83,7 @@ import {
   type PreviewSpec,
 } from "@/src/lib/tikz/previews";
 import { previewClickSpan } from "@/src/lib/tikz/preview-source";
+import type { EngineCanvasInfo } from "@/src/lib/tikz/useTikzjax";
 import type {
   Bounds,
   CurveGeometry,
@@ -331,12 +334,16 @@ interface DiagramCanvasProps {
   doc: TikzDocument;
   source: string;
   preview: PreviewSpec | null;
+  engine: EngineCanvasInfo;
   selectedKeys: string[];
   onSelect: (keys: string[]) => void;
   onSourceChange: (source: string) => void;
   fitSignal: number;
   onLoadExample: () => void;
   onPreviewReveal: (span: Span | null) => void;
+  onEngineRetry: () => void;
+  onEngineUseNative: () => void;
+  onEngineUse: () => void;
   mobileActive: boolean;
 }
 
@@ -1641,12 +1648,16 @@ export function DiagramCanvas({
   doc,
   source,
   preview,
+  engine,
   selectedKeys,
   onSelect,
   onSourceChange,
   fitSignal,
   onLoadExample,
   onPreviewReveal,
+  onEngineRetry,
+  onEngineUseNative,
+  onEngineUse,
   mobileActive,
 }: DiagramCanvasProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -1655,6 +1666,7 @@ export function DiagramCanvas({
   const sourceRef = useRef(source);
   const docRef = useRef(doc);
   const previewRef = useRef(preview);
+  const engineRef = useRef(engine);
   const dragRef = useRef<DragState | null>(null);
   const curveDragRef = useRef<CurveDragState | null>(null);
   const resizeRef = useRef<ResizeState | null>(null);
@@ -1713,6 +1725,7 @@ export function DiagramCanvas({
   sourceRef.current = source;
   docRef.current = doc;
   previewRef.current = preview;
+  engineRef.current = engine;
   selectedKeysRef.current = selectedKeys;
   editingRef.current = editing;
   transformRef.current = transform;
@@ -3951,7 +3964,10 @@ export function DiagramCanvas({
         event.button === 1 ||
         event.button === 2 ||
         (event.button === 0 &&
-          (panToolRef.current || spacePanRef.current || previewRef.current != null));
+          (panToolRef.current ||
+            spacePanRef.current ||
+            previewRef.current != null ||
+            engineRef.current.active));
       if (wantsPan) {
         event.preventDefault();
         focusCanvas();
@@ -4009,15 +4025,17 @@ export function DiagramCanvas({
             !moved &&
             !multiTouchRef.current
           ) {
-            onPreviewReveal(
-              previewClickSpan(
-                previewElement,
-                upEvent.clientX,
-                upEvent.clientY,
-                sourceRef.current,
-                upEvent.pointerType,
-              ),
-            );
+            if (previewElement && previewSpec && previewSpec.exampleId !== "engine") {
+              onPreviewReveal(
+                previewClickSpan(
+                  previewElement,
+                  upEvent.clientX,
+                  upEvent.clientY,
+                  sourceRef.current,
+                  upEvent.pointerType,
+                ),
+              );
+            }
           }
         };
         viewport.addEventListener("pointermove", handleMove);
@@ -4359,7 +4377,7 @@ export function DiagramCanvas({
     const handleKey = (event: KeyboardEvent) => {
       if (event.key !== "Delete" && event.key !== "Backspace") return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
-      if (editingRef.current || previewRef.current) return;
+      if (editingRef.current || previewRef.current || engineRef.current.active) return;
       if (!selectedKeysRef.current.length) return;
       const target = event.target as HTMLElement | null;
       if (
@@ -4392,7 +4410,7 @@ export function DiagramCanvas({
       }
       const pane = viewportRef.current?.closest(".canvas-pane");
       if (!pane || (pane as HTMLElement).offsetParent === null) return;
-      if (previewRef.current) return;
+      if (previewRef.current || engineRef.current.active) return;
       const current = docRef.current;
       const keys = [
         ...current.nodes.filter((node) => node.origin !== "tikzcd").map((node) => node.key),
@@ -4413,7 +4431,7 @@ export function DiagramCanvas({
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
-      if (editingRef.current || previewRef.current) return;
+      if (editingRef.current || previewRef.current || engineRef.current.active) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (!event.key.startsWith("Arrow")) return;
       if (!selectedKeysRef.current.length) return;
@@ -4482,6 +4500,7 @@ export function DiagramCanvas({
   const empty = preview
     ? false
     : !doc.hasPicture || (doc.stats.nodes === 0 && doc.stats.paths === 0);
+  const engineBusy = engine.active && !preview;
   const issueCount = doc.issues.length;
 
   const multiMeta = useMemo(() => {
@@ -4643,7 +4662,7 @@ export function DiagramCanvas({
 
   return (
     <section
-      className={`canvas-pane${mobileActive ? " is-mobile-active" : ""}${preview ? " is-exact-preview" : ""}`}
+      className={`canvas-pane${mobileActive ? " is-mobile-active" : ""}${preview || engine.active ? " is-exact-preview" : ""}`}
     >
       <header className="pane-head canvas-head">
         <div className="pane-title">
@@ -4656,10 +4675,32 @@ export function DiagramCanvas({
         </div>
         <div className="pane-head-actions">
           {preview ? (
-            <span className="render-clean is-preview" title="由 TeX 预编译的精确矢量预览">
-              <Check size={13} />
-              {preview.packageName} 精确预览
-            </span>
+            preview.exampleId === "engine" ? (
+              <span
+                className="render-clean is-preview is-engine"
+                title="由内置 TeX 引擎即时编译的完整矢量输出"
+              >
+                <Check size={13} />
+                TikZ 引擎 · 完整渲染
+              </span>
+            ) : (
+              <span className="render-clean is-preview" title="由 TeX 预编译的精确矢量预览">
+                <Check size={13} />
+                {preview.packageName} 精确预览
+              </span>
+            )
+          ) : engine.active ? (
+            engine.status === "error" ? (
+              <span className="render-clean is-engine is-error" title="TeX 引擎未能编译这段源码">
+                <TriangleAlert size={13} />
+                引擎渲染失败
+              </span>
+            ) : (
+              <span className="render-clean is-engine" title="正在用内置 TeX 引擎编译">
+                <Loader2 size={13} className="export-spin" />
+                引擎编译中
+              </span>
+            )
           ) : issueCount > 0 ? (
             <button
               type="button"
@@ -4686,7 +4727,7 @@ export function DiagramCanvas({
                 setExportError(null);
                 setExportOpen((open) => !open);
               }}
-              disabled={empty || exporting != null}
+              disabled={empty || engineBusy || exporting != null}
               aria-haspopup="menu"
               aria-expanded={exportOpen}
               title={empty ? "画布为空，暂无可导出的图形" : "导出当前图形"}
@@ -4923,10 +4964,14 @@ export function DiagramCanvas({
         >
           {preview ? (
             <div
-              className="advanced-preview"
+              className={`advanced-preview${preview.exampleId === "engine" ? " is-engine" : ""}`}
               role="img"
-              title="单击节点、箭头或标签定位到源码；拖动平移画布"
-              aria-label={`${preview.name}：${preview.packageName} 精确矢量预览`}
+              title={
+                preview.exampleId === "engine"
+                  ? "由 TeX 引擎完整渲染；拖动平移画布"
+                  : "单击节点、箭头或标签定位到源码；拖动平移画布"
+              }
+              aria-label={`${preview.name}：${preview.packageName} 矢量预览`}
               style={{
                 left: `${(-preview.widthCm / 2) * PX_PER_CM}px`,
                 top: `${(-preview.heightCm / 2) * PX_PER_CM}px`,
@@ -5298,17 +5343,102 @@ export function DiagramCanvas({
           )}
         </div>
 
-        {preview ? (
-          <div className="advanced-preview-note" data-canvas-ui="true">
-            <span className="advanced-preview-package">{preview.packageName}</span>
-            <span className="advanced-preview-copy">
-              <strong>{preview.name}</strong>
-              <small>{preview.description}</small>
-            </span>
-            <span className="advanced-preview-hint">
-              单击组件定位源码 · 拖动平移
-            </span>
+        {engineBusy ? (
+          <div className="engine-overlay">
+            <div
+              className={`engine-card${engine.status === "error" ? " is-error" : ""}`}
+              data-canvas-ui="true"
+              role={engine.status === "error" ? "alert" : "status"}
+            >
+              {engine.status === "error" ? (
+                <>
+                  <div className="engine-card-head">
+                    <TriangleAlert size={16} />
+                    <strong>TeX 引擎未能渲染这段源码</strong>
+                  </div>
+                  <p className="engine-card-message">{engine.error}</p>
+                  {engine.hint ? (
+                    <p className="engine-card-hint">{engine.hint}</p>
+                  ) : null}
+                  {engine.detail ? (
+                    <details className="engine-card-log">
+                      <summary>查看编译日志</summary>
+                      <pre>{engine.detail}</pre>
+                    </details>
+                  ) : null}
+                  <div className="engine-card-actions">
+                    <button
+                      type="button"
+                      className="button button-accent button-small"
+                      onClick={onEngineRetry}
+                    >
+                      <RefreshCw size={13} />
+                      重试编译
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-ghost button-small"
+                      onClick={onEngineUseNative}
+                    >
+                      <MousePointer2 size={13} />
+                      改用原生渲染
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="engine-card-head">
+                    <Loader2 size={16} className="export-spin" />
+                    <strong>正在用 TeX 引擎编译</strong>
+                  </div>
+                  <p className="engine-card-message">
+                    通过 WebAssembly 运行原生 TeX 排版，完整还原复杂图形。
+                  </p>
+                  {engine.reasons.length > 0 ? (
+                    <div className="engine-reasons">
+                      {engine.reasons.slice(0, 4).map((reason) => (
+                        <span key={reason}>{reason}</span>
+                      ))}
+                    </div>
+                  ) : null}
+                  <p className="engine-card-foot">
+                    首次编译需加载约 14 MB 本地引擎资源，之后会缓存复用。
+                  </p>
+                </>
+              )}
+            </div>
           </div>
+        ) : null}
+
+        {preview ? (
+          preview.exampleId === "engine" ? (
+            <div className="advanced-preview-note is-engine" data-canvas-ui="true">
+              <span className="advanced-preview-package">TikZ</span>
+              <span className="advanced-preview-copy">
+                <strong>{preview.name}</strong>
+                <small>{preview.description}</small>
+              </span>
+              <span className="advanced-preview-actions">
+                <button type="button" onClick={onEngineRetry}>
+                  重新编译
+                </button>
+                <button type="button" onClick={onEngineUseNative}>
+                  转为可编辑
+                </button>
+              </span>
+            </div>
+          ) : (
+            <div className="advanced-preview-note" data-canvas-ui="true">
+              <span className="advanced-preview-package">{preview.packageName}</span>
+              <span className="advanced-preview-copy">
+                <strong>{preview.name}</strong>
+                <small>{preview.description}</small>
+              </span>
+              <span className="advanced-preview-hint">
+                单击组件定位源码 · 拖动平移
+              </span>
+            </div>
+          )
         ) : null}
 
         {alignmentGuides.vertical.length > 0 || alignmentGuides.horizontal.length > 0 ? (
@@ -5348,7 +5478,7 @@ export function DiagramCanvas({
           />
         ) : null}
 
-        {empty ? (
+        {empty && !engine.active ? (
           <div className="canvas-empty" data-canvas-ui="true">
             <div className="empty-mark" aria-hidden="true">
               <Crosshair size={22} />
@@ -5813,6 +5943,25 @@ export function DiagramCanvas({
                 </li>
               ))}
             </ul>
+            {engine.available ? (
+              <button
+                type="button"
+                className="issues-engine-cta"
+                onClick={() => {
+                  setIssuesOpen(false);
+                  onEngineUse();
+                }}
+              >
+                <Sparkles size={13} />
+                <span>
+                  <strong>用 TeX 引擎完整渲染</strong>
+                  <small>支持 \foreach、calc、scope 与自定义宏</small>
+                </span>
+                <ArrowRight size={13} />
+              </button>
+            ) : engine.unavailableHint ? (
+              <p className="issues-engine-hint">{engine.unavailableHint}</p>
+            ) : null}
           </aside>
         ) : null}
       </div>

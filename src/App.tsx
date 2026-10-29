@@ -20,9 +20,19 @@ import {
 } from "@/src/lib/tikz/examples";
 import { parseTikz } from "@/src/lib/tikz/parser";
 import { getExactPreview, previewSourceAnchor } from "@/src/lib/tikz/previews";
+import type { PreviewSpec } from "@/src/lib/tikz/previews";
+import {
+  buildEnginePayload,
+  detectEngineReasons,
+  engineHint,
+  unsupportedEnginePackage,
+} from "@/src/lib/tikz/tikzjax";
+import { useTikzjax } from "@/src/lib/tikz/useTikzjax";
+import type { EngineCanvasInfo } from "@/src/lib/tikz/useTikzjax";
 import type { Span } from "@/src/lib/tikz/types";
 
 type ViewMode = "source" | "canvas";
+type RenderMode = "auto" | "engine" | "native";
 
 interface HistoryState {
   past: string[];
@@ -60,6 +70,8 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("canvas");
+  const [renderMode, setRenderMode] = useState<RenderMode>("auto");
+  const [engineRetry, setEngineRetry] = useState(0);
   const [sourceReveal, setSourceReveal] = useState<{
     span: Span;
     signal: number;
@@ -68,6 +80,7 @@ export default function App() {
   const exampleWrapRef = useRef<HTMLDivElement>(null);
   const toastTimerRef = useRef<number | null>(null);
   const sourceRef = useRef(source);
+  const lastEngineFitRef = useRef<string | null>(null);
   const historyRef = useRef<HistoryState>({ past: [], future: [] });
   const pendingBaseRef = useRef<string | null>(null);
   const historyTimerRef = useRef<number | null>(null);
@@ -80,6 +93,31 @@ export default function App() {
     if (preview && doc.tikzcd?.native) return null;
     return preview;
   }, [source, doc]);
+  const engineReasons = useMemo(() => detectEngineReasons(source, doc), [source, doc]);
+  const engineUnsupported = useMemo(() => unsupportedEnginePackage(source), [source]);
+  const engineAvailable = useMemo(() => buildEnginePayload(source) != null, [source]);
+  const engineActive = useMemo(() => {
+    if (exactPreview || !engineAvailable || renderMode === "native" || engineUnsupported) {
+      return false;
+    }
+    if (renderMode === "engine") return true;
+    return engineReasons.length > 0;
+  }, [exactPreview, engineAvailable, renderMode, engineReasons, engineUnsupported]);
+  const engine = useTikzjax(source, engineActive, engineRetry);
+  const enginePreview = useMemo<PreviewSpec | null>(() => {
+    if (!engineActive || engine.status !== "ready" || !engine.result) return null;
+    return {
+      exampleId: "engine",
+      name: "TeX 引擎完整渲染",
+      packageName: "TikZ",
+      packageLabel: "TeX 引擎 · WebAssembly",
+      description: "由内置 TeX 引擎即时编译，完整还原源码图形",
+      svg: engine.result.svg,
+      widthCm: engine.result.widthCm,
+      heightCm: engine.result.heightCm,
+    };
+  }, [engineActive, engine.status, engine.result]);
+  const activePreview = enginePreview ?? exactPreview;
   const activeExampleId = useMemo(() => {
     const trimmed = source.trim();
     if (trimmed === BLANK_TIKZ_SOURCE.trim()) return "blank";
@@ -112,8 +150,16 @@ export default function App() {
   }, [doc]);
 
   useEffect(() => {
-    if (exactPreview) setSelectedKeys([]);
-  }, [exactPreview]);
+    if (exactPreview || engineActive) setSelectedKeys([]);
+  }, [exactPreview, engineActive]);
+
+  useEffect(() => {
+    if (!enginePreview) return;
+    const signature = `${enginePreview.widthCm.toFixed(2)}x${enginePreview.heightCm.toFixed(2)}`;
+    if (lastEngineFitRef.current === signature) return;
+    lastEngineFitRef.current = signature;
+    setFitSignal((value) => value + 1);
+  }, [enginePreview]);
 
   const syncHistoryFlags = useCallback(() => {
     setHistoryFlags({
@@ -266,10 +312,49 @@ export default function App() {
       setSelectedKeys([]);
       setFitSignal((value) => value + 1);
       setResetSignal((value) => value + 1);
+      setRenderMode("auto");
+      lastEngineFitRef.current = null;
       setExamplesOpen(false);
       setViewMode("canvas");
     },
     [applySource, commitPending],
+  );
+
+  const retryEngine = useCallback(() => {
+    setEngineRetry((value) => value + 1);
+  }, []);
+
+  const useNativeRendering = useCallback(() => {
+    setRenderMode("native");
+  }, []);
+
+  const useEngineRendering = useCallback(() => {
+    setRenderMode("engine");
+    setEngineRetry((value) => value + 1);
+  }, []);
+
+  const engineInfo = useMemo<EngineCanvasInfo>(
+    () => ({
+      active: engineActive,
+      status: engine.status,
+      reasons: engineReasons,
+      error: engine.error,
+      detail: engine.detail,
+      hint: engine.hint,
+      available: engineAvailable && engineUnsupported == null,
+      unavailableHint: engineUnsupported ? engineHint(source) : null,
+    }),
+    [
+      engineActive,
+      engine.status,
+      engineReasons,
+      engine.error,
+      engine.detail,
+      engine.hint,
+      engineAvailable,
+      engineUnsupported,
+      source,
+    ],
   );
 
   const copySource = useCallback(async () => {
@@ -506,6 +591,19 @@ export default function App() {
                 <i />
                 {exactPreview.packageName} 精确预览
               </span>
+            ) : engineActive ? (
+              <span
+                className={`source-status${
+                  engine.status === "error" ? " has-warning" : " is-preview"
+                }`}
+              >
+                <i />
+                {engine.status === "error"
+                  ? "TeX 引擎编译失败"
+                  : engine.status === "ready"
+                    ? "TeX 引擎完整渲染"
+                    : "TeX 引擎编译中"}
+              </span>
             ) : (
               <span className={`source-status${warningCount > 0 ? " has-warning" : ""}`}>
                 <i />
@@ -519,6 +617,12 @@ export default function App() {
                   <span>TeX 预编译矢量</span>
                   <span>编辑源码后回到原生渲染</span>
                 </>
+              ) : engineActive ? (
+                <>
+                  <span>TikZ · WebAssembly</span>
+                  <span>完整矢量输出</span>
+                  <span>{engineReasons[0] ?? "手动启用引擎"}</span>
+                </>
               ) : (
                 <>
                   <span>{doc.stats.nodes} 节点</span>
@@ -528,20 +632,24 @@ export default function App() {
                 </>
               )}
             </span>
-            <span className="source-privacy">本地解析 · 源码不会上传</span>
+            <span className="source-privacy">本地编译 · 源码不会上传</span>
           </footer>
         </section>
 
         <DiagramCanvas
           doc={doc}
           source={source}
-          preview={exactPreview}
+          preview={activePreview}
+          engine={engineInfo}
           selectedKeys={selectedKeys}
           onSelect={setSelectedKeys}
           onSourceChange={applySource}
           fitSignal={fitSignal}
           onLoadExample={() => loadSource(DEFAULT_TIKZ_SOURCE)}
           onPreviewReveal={revealPreviewSource}
+          onEngineRetry={retryEngine}
+          onEngineUseNative={useNativeRendering}
+          onEngineUse={useEngineRendering}
           mobileActive={viewMode === "canvas"}
         />
       </main>

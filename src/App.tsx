@@ -244,10 +244,10 @@ export default function App() {
     toastTimerRef.current = window.setTimeout(() => setToast(null), 2400);
   }, []);
 
-  const revealPreviewSource = useCallback(() => {
-    const span = previewSourceAnchor(sourceRef.current);
+  const revealPreviewSource = useCallback((span: Span | null) => {
+    const target = span ?? previewSourceAnchor(sourceRef.current);
     setSourceReveal((current) => ({
-      span,
+      span: target,
       signal: (current?.signal ?? 0) + 1,
     }));
     setViewMode("source");
@@ -650,7 +650,7 @@ export default function App() {
                   </span>
                 </div>
                 <div className="help-row">
-                  <span>折线角度与直角吸附（90° 附近）</span>
+                  <span>折线直角与横平竖直吸附</span>
                   <span className="help-keys">
                     <kbd>拖动折点</kbd>
                     <span>/</span>
@@ -695,9 +695,9 @@ export default function App() {
                   </span>
                 </div>
                 <div className="help-row">
-                  <span>预览示例定位源码</span>
+                  <span>预览组件定位源码</span>
                   <span className="help-keys">
-                    <kbd>单击预览</kbd>
+                    <kbd>单击节点 / 箭头 / 标签</kbd>
                   </span>
                 </div>
                 <div className="help-row">

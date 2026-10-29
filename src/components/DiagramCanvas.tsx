@@ -76,6 +76,7 @@ import {
   previewBounds,
   type PreviewSpec,
 } from "@/src/lib/tikz/previews";
+import { previewClickSpan } from "@/src/lib/tikz/preview-source";
 import type {
   Bounds,
   CurveGeometry,
@@ -102,6 +103,8 @@ const ATTACH_SNAP_PX = 16;
 const COARSE_ATTACH_SNAP_PX = 26;
 const RIGHT_ANGLE_SNAP_DEG = 7;
 const COARSE_RIGHT_ANGLE_SNAP_DEG = 12;
+const ORTHO_SNAP_PX = 28;
+const COARSE_ORTHO_SNAP_PX = 40;
 
 type Corner = "nw" | "ne" | "sw" | "se";
 type ExportFormat = "svg" | "png" | "jpg";
@@ -328,7 +331,7 @@ interface DiagramCanvasProps {
   onSourceChange: (source: string) => void;
   fitSignal: number;
   onLoadExample: () => void;
-  onPreviewReveal: () => void;
+  onPreviewReveal: (span: Span | null) => void;
   mobileActive: boolean;
 }
 
@@ -714,6 +717,45 @@ function rightAngleJoint(context: JointSnapContext, joint: Point): Point {
     if (!snapped) return point;
     if (Math.hypot(snapped.x - point.x, snapped.y - point.y) < 1e-4) return snapped;
     point = snapped;
+  }
+  return point;
+}
+
+function orthogonalJoint(
+  context: JointSnapContext,
+  joint: Point,
+  radius: number,
+): Point | null {
+  const from = jointEndpoint(context.fromNode, context.from, joint);
+  const to = jointEndpoint(context.toNode, context.to, joint);
+  const options = [
+    { point: { x: from.x, y: to.y }, verticalFirst: true },
+    { point: { x: to.x, y: from.y }, verticalFirst: false },
+  ].filter((option) => {
+    const legA = Math.hypot(option.point.x - from.x, option.point.y - from.y);
+    const legB = Math.hypot(to.x - option.point.x, to.y - option.point.y);
+    return legA >= 0.3 && legB >= 0.3;
+  });
+  if (options.length === 0) return null;
+  let best = options[0];
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const option of options) {
+    const distance = Math.hypot(option.point.x - joint.x, option.point.y - joint.y);
+    if (distance < bestDistance) {
+      best = option;
+      bestDistance = distance;
+    }
+  }
+  if (bestDistance > radius) return null;
+  let point = best.point;
+  for (let iteration = 0; iteration < 4; iteration += 1) {
+    const liveFrom = jointEndpoint(context.fromNode, context.from, point);
+    const liveTo = jointEndpoint(context.toNode, context.to, point);
+    const next = best.verticalFirst
+      ? { x: liveFrom.x, y: liveTo.y }
+      : { x: liveTo.x, y: liveFrom.y };
+    if (Math.hypot(next.x - point.x, next.y - point.y) < 1e-4) return next;
+    point = next;
   }
   return point;
 }
@@ -3602,13 +3644,21 @@ export function DiagramCanvas({
         point = { x: snap(point.x, step), y: snap(point.y, step) };
         const magnet = magnetRef.current && !moveEvent.altKey;
         if (magnet) {
-          const angle = jointAngleDegrees(handle, point);
-          const threshold =
-            moveEvent.pointerType === "touch"
-              ? COARSE_RIGHT_ANGLE_SNAP_DEG
-              : RIGHT_ANGLE_SNAP_DEG;
-          if (Math.abs(angle - 90) <= threshold) {
-            point = rightAngleJoint(handle, point);
+          const orthoRadius =
+            (moveEvent.pointerType === "touch" ? COARSE_ORTHO_SNAP_PX : ORTHO_SNAP_PX) /
+            Math.max(0.05, zoom * PX_PER_CM);
+          const ortho = orthogonalJoint(handle, point, orthoRadius);
+          if (ortho) {
+            point = ortho;
+          } else {
+            const angle = jointAngleDegrees(handle, point);
+            const threshold =
+              moveEvent.pointerType === "touch"
+                ? COARSE_RIGHT_ANGLE_SNAP_DEG
+                : RIGHT_ANGLE_SNAP_DEG;
+            if (Math.abs(angle - 90) <= threshold) {
+              point = rightAngleJoint(handle, point);
+            }
           }
         }
         onSourceChange(
@@ -3672,13 +3722,21 @@ export function DiagramCanvas({
         point = { x: snap(point.x, step), y: snap(point.y, step) };
         const magnet = magnetRef.current && !moveEvent.altKey;
         if (magnet) {
-          const angle = jointAngleDegrees(vertex, point);
-          const threshold =
-            moveEvent.pointerType === "touch"
-              ? COARSE_RIGHT_ANGLE_SNAP_DEG
-              : RIGHT_ANGLE_SNAP_DEG;
-          if (Math.abs(angle - 90) <= threshold) {
-            point = rightAngleJoint(vertex, point);
+          const orthoRadius =
+            (moveEvent.pointerType === "touch" ? COARSE_ORTHO_SNAP_PX : ORTHO_SNAP_PX) /
+            Math.max(0.05, zoom * PX_PER_CM);
+          const ortho = orthogonalJoint(vertex, point, orthoRadius);
+          if (ortho) {
+            point = ortho;
+          } else {
+            const angle = jointAngleDegrees(vertex, point);
+            const threshold =
+              moveEvent.pointerType === "touch"
+                ? COARSE_RIGHT_ANGLE_SNAP_DEG
+                : RIGHT_ANGLE_SNAP_DEG;
+            if (Math.abs(angle - 90) <= threshold) {
+              point = rightAngleJoint(vertex, point);
+            }
           }
         }
         onSourceChange(
@@ -3756,10 +3814,11 @@ export function DiagramCanvas({
         const startX = transformRef.current.x;
         const startY = transformRef.current.y;
         const previewSpec = previewRef.current;
-        const previewTarget = Boolean(
-          previewSpec &&
-            (event.target as Element).closest?.(".advanced-preview"),
-        );
+        const previewElement = previewSpec
+          ? ((event.target as Element).closest?.(
+              ".advanced-preview",
+            ) as HTMLElement | null)
+          : null;
         let moved = false;
         const handleMove = (moveEvent: PointerEvent) => {
           if (moveEvent.pointerId !== pointerId || multiTouchRef.current) return;
@@ -3793,12 +3852,19 @@ export function DiagramCanvas({
           if (
             upEvent.type === "pointerup" &&
             event.button === 0 &&
-            previewSpec &&
-            previewTarget &&
+            previewElement &&
             !moved &&
             !multiTouchRef.current
           ) {
-            onPreviewReveal();
+            onPreviewReveal(
+              previewClickSpan(
+                previewElement,
+                upEvent.clientX,
+                upEvent.clientY,
+                sourceRef.current,
+                upEvent.pointerType,
+              ),
+            );
           }
         };
         viewport.addEventListener("pointermove", handleMove);
@@ -4625,7 +4691,7 @@ export function DiagramCanvas({
             <div
               className="advanced-preview"
               role="img"
-              title="单击定位到源码；拖动平移画布"
+              title="单击节点、箭头或标签定位到源码；拖动平移画布"
               aria-label={`${preview.name}：${preview.packageName} 精确矢量预览`}
               style={{
                 left: `${(-preview.widthCm / 2) * PX_PER_CM}px`,
@@ -4998,7 +5064,7 @@ export function DiagramCanvas({
               <small>{preview.description}</small>
             </span>
             <span className="advanced-preview-hint">
-              单击定位源码 · 拖动平移
+              单击组件定位源码 · 拖动平移
             </span>
           </div>
         ) : null}

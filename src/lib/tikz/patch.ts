@@ -631,16 +631,40 @@ function pathReferencesNodeNames(
   return false;
 }
 
+function selectionIncludesTikzCd(objects: SelectionEditObjects): boolean {
+  return (
+    objects.nodes.some((node) => node.origin === "tikzcd") ||
+    objects.labels.some((label) => label.origin === "tikzcd") ||
+    objects.paths.some((path) => path.origin === "tikzcd")
+  );
+}
+
+function tikzCdArrowDeletionSpan(source: string, span: Span): Span {
+  const lineSpan = lineDeletionSpan(source, span);
+  if (lineSpan.start !== span.start || lineSpan.end !== span.end) return lineSpan;
+  let start = span.start;
+  while (start > 0 && (source[start - 1] === " " || source[start - 1] === "\t")) {
+    start -= 1;
+  }
+  return { start, end: span.end };
+}
+
 export function deleteSelectionObjects(
   source: string,
   doc: TikzDocument,
   objects: SelectionEditObjects,
 ): string {
   const edits: SourceEdit[] = [];
-  const selectedNodeNames = new Set(objects.nodes.map((node) => node.name).filter(Boolean));
+  const selectedNodeNames = new Set(
+    objects.nodes
+      .filter((node) => node.origin !== "tikzcd")
+      .map((node) => node.name)
+      .filter(Boolean),
+  );
   const selectedNodeKeys = new Set(objects.nodes.map((node) => node.key));
 
   for (const node of objects.nodes) {
+    if (node.origin === "tikzcd") continue;
     const span = lineDeletionSpan(source, node.commandSpan);
     edits.push({ ...span, text: "" });
   }
@@ -658,6 +682,11 @@ export function deleteSelectionObjects(
   for (const path of objects.paths) {
     if (removedPaths.has(path.index)) continue;
     removedPaths.add(path.index);
+    if (path.origin === "tikzcd") {
+      const span = tikzCdArrowDeletionSpan(source, path.commandSpan);
+      edits.push({ ...span, text: "" });
+      continue;
+    }
     const span = lineDeletionSpan(source, path.commandSpan);
     edits.push({ ...span, text: "" });
   }
@@ -665,6 +694,7 @@ export function deleteSelectionObjects(
   if (selectedNodeNames.size > 0) {
     for (const path of doc.paths) {
       if (removedPaths.has(path.index)) continue;
+      if (path.origin === "tikzcd") continue;
       if (!pathReferencesNodeNames(path, selectedNodeNames)) continue;
       removedPaths.add(path.index);
       const span = lineDeletionSpan(source, path.commandSpan);
@@ -695,6 +725,7 @@ export function deleteSelectionObjects(
   }
 
   for (const label of objects.labels) {
+    if (label.origin === "tikzcd") continue;
     if (removedPaths.has(label.pathIndex)) continue;
     const span = labelDeletionSpan(source, label);
     if (span) edits.push({ start: span.start, end: span.end, text: "" });
@@ -709,6 +740,7 @@ export function patchSelectionTranslation(
   dx: number,
   dy: number,
 ): string {
+  if (selectionIncludesTikzCd(objects)) return source;
   const edits: SourceEdit[] = [];
   for (const node of objects.nodes) {
     edits.push(...nodePositionEdits(source, node, node.x + dx, node.y + dy));
@@ -745,6 +777,7 @@ export function patchSelectionScale(
   from: Bounds,
   to: Bounds,
 ): string {
+  if (selectionIncludesTikzCd(objects)) return source;
   const scaleX = (to.maxX - to.minX) / Math.max(from.maxX - from.minX, 0.0001);
   const scaleY = (to.maxY - to.minY) / Math.max(from.maxY - from.minY, 0.0001);
   const mapX = (value: number) => to.minX + (value - from.minX) * scaleX;
@@ -813,6 +846,137 @@ export function validateNodeText(text: string): string | null {
   const dollars = (text.match(/(?<!\\)\$/g) ?? []).length;
   if (dollars % 2 !== 0) return "公式的 $ 符号数量不是成对的";
   return null;
+}
+
+function validateTikzCdMathText(text: string, label: boolean): string | null {
+  if (/[\r\n]/.test(text)) {
+    return label ? "箭头标签不能包含换行，请保持单行内容" : "单元格不能包含换行，请保持单行内容";
+  }
+  if (!isBalancedText(text)) return "花括号未闭合，请检查文本中的 { 和 }";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "\\") {
+      if (text[index + 1] === "\\") return "不能包含换行命令 \\\\，请保持单行内容";
+      const command = text.slice(index).match(/^\\([A-Za-z]+)/);
+      if (command) {
+        if (command[1] === "arrow" || command[1] === "ar") {
+          return "不能包含 \\arrow 命令，箭头请写在单元格之外";
+        }
+        index += command[0].length - 1;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+    if (char === "%") return "不能包含 % 注释符号";
+    if (char === "&") return "不能包含表格分隔符 &，单元格由 & 划分";
+    if (char === "$") return "已处于数学模式，不需要再写 $ 符号";
+    if (label && char === '"') return '箭头标签不能包含未转义的英文引号 "';
+  }
+  return null;
+}
+
+export function validateTikzCdCellText(text: string): string | null {
+  return validateTikzCdMathText(text, false);
+}
+
+export function validateTikzCdLabelText(text: string): string | null {
+  return validateTikzCdMathText(text, true);
+}
+
+interface ArrowOptionChunk {
+  start: number;
+  end: number;
+}
+
+function splitArrowOptionChunks(
+  source: string,
+  start: number,
+  end: number,
+): ArrowOptionChunk[] {
+  const chunks: ArrowOptionChunk[] = [];
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let inQuote = false;
+  let chunkStart = start;
+  for (let index = start; index < end; index += 1) {
+    const char = source[index];
+    if (inQuote) {
+      if (char === "\\") index += 1;
+      else if (char === '"') inQuote = false;
+      continue;
+    }
+    if (char === "\\") {
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      inQuote = true;
+      continue;
+    }
+    if (char === "{") braceDepth += 1;
+    else if (char === "}") braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === "[") bracketDepth += 1;
+    else if (char === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === "," && braceDepth === 0 && bracketDepth === 0) {
+      chunks.push({ start: chunkStart, end: index });
+      chunkStart = index + 1;
+    }
+  }
+  chunks.push({ start: chunkStart, end });
+  return chunks.filter((chunk) => source.slice(chunk.start, chunk.end).trim().length > 0);
+}
+
+export type TikzCdLineStyle = "solid" | "dashed" | "dotted";
+export type TikzCdArrowEnds = "->" | "<-" | "<->" | "-";
+export type TikzCdBend = "none" | "left" | "right";
+
+export interface TikzCdArrowStylePatch {
+  line?: TikzCdLineStyle;
+  ends?: TikzCdArrowEnds;
+  bend?: TikzCdBend;
+}
+
+function normalizeArrowOption(text: string): string {
+  return text.trim().replace(/\s+/g, " ").replace(/\s*=\s*/g, "=");
+}
+
+export function patchTikzCdArrow(
+  source: string,
+  path: TikzPath,
+  change: TikzCdArrowStylePatch,
+): string {
+  const optionBlock = path.tikzcd?.optionBlock;
+  if (path.origin !== "tikzcd" || !optionBlock) return source;
+  const kept: string[] = [];
+  for (const chunk of splitArrowOptionChunks(source, optionBlock.start, optionBlock.end)) {
+    const raw = source.slice(chunk.start, chunk.end).trim();
+    if (!raw) continue;
+    const token = normalizeArrowOption(raw);
+    if (change.line && (token === "solid" || token === "dashed" || token === "dotted")) {
+      continue;
+    }
+    if (change.ends && (token === "->" || token === "<-" || token === "<->" || token === "-")) {
+      continue;
+    }
+    if (change.bend && /^bend\s+(left|right)(=[0-9.]+)?$/.test(token)) continue;
+    kept.push(raw);
+  }
+  const additions: string[] = [];
+  if (change.line && change.line !== "solid") additions.push(change.line);
+  if (change.ends) additions.push(change.ends);
+  if (change.bend && change.bend !== "none") additions.push(`bend ${change.bend}`);
+  if (additions.length > 0) {
+    const labelIndex = kept.findIndex((chunk) => chunk.startsWith('"'));
+    kept.splice(labelIndex < 0 ? kept.length : labelIndex, 0, ...additions);
+  }
+  return applySourceEdits(source, [
+    {
+      start: optionBlock.start,
+      end: optionBlock.end,
+      text: kept.length > 0 ? kept.join(", ") : " ",
+    },
+  ]);
 }
 
 function normalizeHexColor(value: string): string | null {

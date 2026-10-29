@@ -534,6 +534,12 @@ button {
   color: var(--moss);
 }
 
+.example-preview-badge.is-native {
+  border-color: rgba(216, 92, 58, 0.3);
+  background: rgba(216, 92, 58, 0.09);
+  color: var(--accent);
+}
+
 .example-check {
   color: var(--accent);
 }
@@ -1551,6 +1557,22 @@ button {
   cursor: grabbing;
 }
 
+.tikz-node.is-cd-cell,
+.tikz-node.is-cd-cell:active {
+  cursor: default;
+}
+
+.tikz-node.is-cd-cell:hover {
+  border-radius: 4px;
+  background: rgba(207, 85, 53, 0.055);
+}
+
+.tikz-node.is-cd-cell .selection-outline {
+  inset: -3px;
+  border-width: 1px;
+  border-style: dashed;
+}
+
 .node-shape {
   position: absolute;
   inset: 0;
@@ -2051,6 +2073,18 @@ button {
 
 .edge-label:active {
   cursor: grabbing;
+}
+
+.edge-label.is-cd,
+.edge-label.is-cd:active {
+  cursor: default;
+}
+
+.edge-label.is-description {
+  padding: 0 3px;
+  border-radius: 2px;
+  background: var(--paper);
+  text-shadow: none;
 }
 
 .edge-label:focus-visible {

@@ -66,11 +66,15 @@ import {
   patchSelectionScale,
   patchSelectionTranslation,
   patchText,
+  patchTikzCdArrow,
   pathHasAttachedEndpoints,
   straightenPathVertex,
   validateNodeText,
+  validateTikzCdCellText,
+  validateTikzCdLabelText,
   type BasicShapeKind,
   type SelectionEditObjects,
+  type TikzCdArrowStylePatch,
 } from "@/src/lib/tikz/patch";
 import {
   previewBounds,
@@ -314,6 +318,7 @@ interface SelectionInfo {
   path?: TikzPath;
   resizeHint?: boolean;
   multi?: boolean;
+  locked?: boolean;
 }
 
 interface EditingState {
@@ -425,6 +430,42 @@ function isSelectableEdge(path: TikzPath): boolean {
     Boolean(path.style.draw) &&
     path.subpaths.some((subpath) => !subpath.shape && subpath.segments.length > 0)
   );
+}
+
+function selectionHasTikzCd(objects: SelectionEditObjects): boolean {
+  return (
+    objects.nodes.some((node) => node.origin === "tikzcd") ||
+    objects.labels.some((label) => label.origin === "tikzcd") ||
+    objects.paths.some((path) => path.origin === "tikzcd")
+  );
+}
+
+function keyIsTikzCd(doc: TikzDocument, key: string): boolean {
+  return (
+    doc.nodes.some((node) => node.key === key && node.origin === "tikzcd") ||
+    doc.labels.some((label) => label.key === key && label.origin === "tikzcd") ||
+    doc.paths.some((path) => path.key === key && path.origin === "tikzcd")
+  );
+}
+
+function tikzCdLineStyle(path: TikzPath): "solid" | "dashed" | "dotted" {
+  return path.style.dotted ? "dotted" : path.style.dashed ? "dashed" : "solid";
+}
+
+function tikzCdArrowEnds(path: TikzPath): "->" | "<-" | "<->" | "-" {
+  if (path.style.arrowStart && path.style.arrowEnd) return "<->";
+  if (path.style.arrowStart) return "<-";
+  if (path.style.arrowEnd) return "->";
+  return "-";
+}
+
+function tikzCdBend(path: TikzPath): "none" | "left" | "right" {
+  return path.style.bend ? path.style.bend.direction : "none";
+}
+
+function renderTikzText(text: string, mathMode?: boolean): string {
+  if (!text) return "";
+  return latexToHtml(mathMode ? `$${text}$` : text);
 }
 
 function subpathPolyline(subpath: PathSubpath): Point[] {
@@ -1275,6 +1316,16 @@ function EdgePath({ path }: { path: TikzPath }) {
           path.style.arrowEnd && !subpath.closed ? tangentAt(subpath, "end") : null;
         return (
           <g key={`${path.key}-sub-${subpathIndex}`}>
+            {path.style.crossing && !subpath.closed ? (
+              <path
+                d={data}
+                fill="none"
+                stroke="var(--paper)"
+                strokeWidth={path.style.lineWidth + 6}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            ) : null}
             <path
               d={data}
               fill={path.fill && path.style.fill ? fill : "none"}
@@ -1409,6 +1460,7 @@ function NodeView({
   ) => void;
 }) {
   const style = node.style;
+  const isCdCell = node.origin === "tikzcd";
   const width = node.width * PX_PER_CM;
   const height = node.height * PX_PER_CM;
   const wrapperStyle: CSSProperties = {
@@ -1437,12 +1489,16 @@ function NodeView({
 
   return (
     <div
-      className={`tikz-node${selected ? " is-selected" : ""}`}
+      className={`tikz-node${isCdCell ? " is-cd-cell" : ""}${selected ? " is-selected" : ""}`}
       style={wrapperStyle}
       data-node-key={node.key}
       role="button"
       tabIndex={0}
-      aria-label={`节点 ${node.name || node.text || "未命名"}，拖拽移动，双击编辑文字`}
+      aria-label={
+        isCdCell
+          ? `tikz-cd 单元格 ${node.text || "空"}，单击选中，双击编辑公式`
+          : `节点 ${node.name || node.text || "未命名"}，拖拽移动，双击编辑文字`
+      }
       onPointerDown={(event) => onPointerDown(event, node)}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -1472,11 +1528,11 @@ function NodeView({
       >
         <span
           className="tikz-rich-text"
-          dangerouslySetInnerHTML={{ __html: latexToHtml(node.text) }}
+          dangerouslySetInnerHTML={{ __html: renderTikzText(node.text, node.mathMode) }}
         />
       </span>
       {selected ? <span className="selection-outline" aria-hidden="true" /> : null}
-      {selected && showHandles ? (
+      {selected && showHandles && !isCdCell ? (
         <>
           <span className="node-badge" aria-hidden="true">
             {node.name || "node"}
@@ -1548,11 +1604,15 @@ function LabelView({
 
   return (
     <div
-      className={`edge-label${selected ? " is-selected" : ""}${label.fill ? " has-fill" : ""}`}
+      className={`edge-label${selected ? " is-selected" : ""}${label.fill ? " has-fill" : ""}${label.description ? " is-description" : ""}${label.origin === "tikzcd" ? " is-cd" : ""}`}
       style={style}
       role="button"
       tabIndex={0}
-      aria-label={`连线标签 ${label.text}，拖拽移动，双击编辑文字`}
+      aria-label={
+        label.origin === "tikzcd"
+          ? `箭头标签 ${label.text || "空"}，单击选中，双击编辑公式`
+          : `连线标签 ${label.text}，拖拽移动，双击编辑文字`
+      }
       onPointerDown={(event) => onPointerDown(event, label)}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -1571,7 +1631,7 @@ function LabelView({
     >
       <span
         className="tikz-rich-text"
-        dangerouslySetInnerHTML={{ __html: latexToHtml(label.text) }}
+        dangerouslySetInnerHTML={{ __html: renderTikzText(label.text, label.mathMode) }}
       />
     </div>
   );
@@ -1599,6 +1659,7 @@ export function DiagramCanvas({
   const curveDragRef = useRef<CurveDragState | null>(null);
   const resizeRef = useRef<ResizeState | null>(null);
   const labelDragRef = useRef<LabelDragState | null>(null);
+  const cdLabelTapRef = useRef<{ key: string; at: number } | null>(null);
   const frameResizeRef = useRef<FrameResizeState | null>(null);
   const selectedKeysRef = useRef(selectedKeys);
   const editingRef = useRef<EditingState | null>(null);
@@ -1668,6 +1729,10 @@ export function DiagramCanvas({
     () => collectSelection(doc, selectedKeys),
     [doc, selectedKeys],
   );
+  const selectionLocked = useMemo(
+    () => selectionHasTikzCd(selectionObjects),
+    [selectionObjects],
+  );
   const selectedCount = selectionSize(selectionObjects);
   const groupBounds = useMemo(() => selectionBounds(selectionObjects), [selectionObjects]);
   const soleKey = selectedKeys.length === 1 ? selectedKeys[0] : null;
@@ -1698,22 +1763,31 @@ export function DiagramCanvas({
       ? fontPointsFromPixels(selectedLabel.fontSize)
       : null;
   const selectedPathHandles = useMemo(
-    () => (selectedPath ? pathEndpointHandles(selectedPath) : []),
+    () =>
+      selectedPath && selectedPath.origin !== "tikzcd"
+        ? pathEndpointHandles(selectedPath)
+        : [],
     [selectedPath],
   );
   const selectedCurveHandles = useMemo(
-    () => (selectedPath ? pathCurveHandles(selectedPath, source) : []),
+    () =>
+      selectedPath && selectedPath.origin !== "tikzcd"
+        ? pathCurveHandles(selectedPath, source)
+        : [],
     [selectedPath, source],
   );
   const selectedPolylineHandles = useMemo(
     () =>
-      selectedPath && bendMode === "polyline"
+      selectedPath && selectedPath.origin !== "tikzcd" && bendMode === "polyline"
         ? pathPolylineHandles(selectedPath, source)
         : [],
     [bendMode, selectedPath, source],
   );
   const selectedVertexHandles = useMemo(
-    () => (selectedPath ? pathVertexHandles(selectedPath, source) : []),
+    () =>
+      selectedPath && selectedPath.origin !== "tikzcd"
+        ? pathVertexHandles(selectedPath, source)
+        : [],
     [selectedPath, source],
   );
   const pathAttachNodes = useMemo(() => {
@@ -1741,6 +1815,14 @@ export function DiagramCanvas({
   const toggleSelection = useCallback(
     (key: string) => {
       const current = selectedKeysRef.current;
+      const doc = docRef.current;
+      const nextIsCd = keyIsTikzCd(doc, key);
+      const currentHasCd = current.some((item) => keyIsTikzCd(doc, item));
+      const currentHasOther = current.some((item) => !keyIsTikzCd(doc, item));
+      if (current.length > 0 && (nextIsCd ? currentHasOther : currentHasCd)) {
+        onSelect([key]);
+        return;
+      }
       onSelect(
         current.includes(key)
           ? current.filter((item) => item !== key)
@@ -2075,6 +2157,7 @@ export function DiagramCanvas({
   const openEditor = useCallback(
     (object: TikzNode | TikzLabel) => {
       const isNode = object.kind === "node";
+      if (isNode && object.origin === "tikzcd" && !object.textEditable) return;
       setIssuesOpen(false);
       setDraft(object.text);
       setDraftError(null);
@@ -2082,8 +2165,12 @@ export function DiagramCanvas({
         key: object.key,
         kind: isNode ? "node" : "label",
         title: isNode
-          ? `编辑节点 · ${object.name || `#${(object as TikzNode).index + 1}`}`
-          : "编辑连线标签",
+          ? object.origin === "tikzcd" && object.tikzcdCell
+            ? `编辑单元格 · 第 ${object.tikzcdCell.row + 1} 行第 ${object.tikzcdCell.col + 1} 列`
+            : `编辑节点 · ${object.name || `#${(object as TikzNode).index + 1}`}`
+          : object.origin === "tikzcd"
+            ? "编辑箭头标签"
+            : "编辑连线标签",
       });
       selectOnly(object.key);
     },
@@ -2105,7 +2192,12 @@ export function DiagramCanvas({
       closeEditor();
       return;
     }
-    const error = validateNodeText(draft);
+    const error =
+      object.origin === "tikzcd"
+        ? editing.kind === "node"
+          ? validateTikzCdCellText(draft)
+          : validateTikzCdLabelText(draft)
+        : validateNodeText(draft);
     if (error) {
       setDraftError(error);
       return;
@@ -2199,6 +2291,25 @@ export function DiagramCanvas({
       onSourceChange(next);
     },
     [onSourceChange, selectedLabel?.key],
+  );
+
+  const changeTikzCdArrow = useCallback(
+    (change: TikzCdArrowStylePatch) => {
+      const key = selectedPath?.key;
+      if (!key) return;
+      const currentSource = sourceRef.current;
+      const path = parseTikz(currentSource).paths.find((item) => item.key === key);
+      if (!path || path.origin !== "tikzcd") return;
+      if (
+        (change.line && tikzCdLineStyle(path) === change.line) ||
+        (change.ends && tikzCdArrowEnds(path) === change.ends) ||
+        (change.bend && tikzCdBend(path) === change.bend)
+      ) {
+        return;
+      }
+      onSourceChange(patchTikzCdArrow(currentSource, path, change));
+    },
+    [onSourceChange, selectedPath?.key],
   );
 
   const stepSelectedFontSize = useCallback(
@@ -2557,6 +2668,7 @@ export function DiagramCanvas({
       if (event.button !== 0) return;
       const objects = collectSelection(docRef.current, selectedKeysRef.current);
       if (selectionSize(objects) < 2) return;
+      if (selectionHasTikzCd(objects)) return;
       event.preventDefault();
       event.stopPropagation();
       setIssuesOpen(false);
@@ -2660,6 +2772,7 @@ export function DiagramCanvas({
       const objects = collectSelection(docRef.current, selectedKeysRef.current);
       const bounds = selectionBounds(objects);
       if (!bounds || selectionSize(objects) < 2) return;
+      if (selectionHasTikzCd(objects)) return;
       event.preventDefault();
       event.stopPropagation();
       setIssuesOpen(false);
@@ -2732,6 +2845,16 @@ export function DiagramCanvas({
     (event: ReactPointerEvent<HTMLDivElement>, node: TikzNode) => {
       if (shapeToolRef.current) return;
       if (event.button !== 0) return;
+      if (node.origin === "tikzcd") {
+        event.stopPropagation();
+        event.preventDefault();
+        (event.currentTarget as HTMLElement).focus({ preventScroll: true });
+        setIssuesOpen(false);
+        if (editing && editing.key !== node.key) closeEditor();
+        if (event.shiftKey) toggleSelection(node.key);
+        else selectOnly(node.key);
+        return;
+      }
       event.stopPropagation();
       event.preventDefault();
       (event.currentTarget as HTMLElement).focus({ preventScroll: true });
@@ -2830,6 +2953,26 @@ export function DiagramCanvas({
     (event: ReactPointerEvent<HTMLDivElement>, label: TikzLabel) => {
       if (shapeToolRef.current) return;
       if (event.button !== 0) return;
+      if (label.origin === "tikzcd") {
+        event.stopPropagation();
+        (event.currentTarget as HTMLElement).focus({ preventScroll: true });
+        setIssuesOpen(false);
+        if (editing && editing.key !== label.key) closeEditor();
+        if (event.shiftKey) {
+          toggleSelection(label.key);
+          return;
+        }
+        const now = Date.now();
+        const lastTap = cdLabelTapRef.current;
+        if (lastTap && lastTap.key === label.key && now - lastTap.at < 400) {
+          cdLabelTapRef.current = null;
+          openEditor(label);
+          return;
+        }
+        cdLabelTapRef.current = { key: label.key, at: now };
+        selectOnly(label.key);
+        return;
+      }
       event.stopPropagation();
       event.preventDefault();
       (event.currentTarget as HTMLElement).focus({ preventScroll: true });
@@ -2862,7 +3005,7 @@ export function DiagramCanvas({
         moved: false,
       };
     },
-    [beginGroupMove, closeEditor, editing, selectOnly, toggleSelection],
+    [beginGroupMove, closeEditor, editing, openEditor, selectOnly, toggleSelection],
   );
 
   const moveLabelDrag = useCallback(
@@ -3196,6 +3339,16 @@ export function DiagramCanvas({
   const beginPathDrag = useCallback(
     (event: ReactPointerEvent<HTMLElement>, path: TikzPath) => {
       if (event.button !== 0 || multiTouchRef.current) return;
+      if (path.origin === "tikzcd") {
+        event.preventDefault();
+        event.stopPropagation();
+        viewportRef.current?.focus({ preventScroll: true });
+        setIssuesOpen(false);
+        if (editingRef.current) closeEditor();
+        if (event.shiftKey) toggleSelection(path.key);
+        else selectOnly(path.key);
+        return;
+      }
       const current = selectedKeysRef.current;
       if (current.length > 1 && current.includes(path.key)) {
         beginGroupMove(event, path.key);
@@ -3362,7 +3515,7 @@ export function DiagramCanvas({
       window.addEventListener("pointerup", finish);
       window.addEventListener("pointercancel", finish);
     },
-    [beginGroupMove, closeEditor, onSourceChange, selectOnly],
+    [beginGroupMove, closeEditor, onSourceChange, selectOnly, toggleSelection],
   );
 
   const startPathEndpointDrag = useCallback(
@@ -4105,16 +4258,19 @@ export function DiagramCanvas({
           const hits: string[] = [];
           if (filter.shapes) {
             for (const node of docRef.current.nodes) {
+              if (node.origin === "tikzcd") continue;
               if (boundsIntersect(node.bounds, range)) hits.push(node.key);
             }
           }
           if (filter.labels) {
             for (const label of docRef.current.labels) {
+              if (label.origin === "tikzcd") continue;
               if (boundsIntersect(label.bounds, range)) hits.push(label.key);
             }
           }
           if (filter.edges) {
             for (const path of docRef.current.paths) {
+              if (path.origin === "tikzcd") continue;
               if (isSelectableEdge(path) && pathIntersectsBounds(path, range)) {
                 hits.push(path.key);
               }
@@ -4175,6 +4331,7 @@ export function DiagramCanvas({
     (dx: number, dy: number) => {
       const objects = collectSelection(docRef.current, selectedKeysRef.current);
       if (selectionSize(objects) === 0) return;
+      if (selectionHasTikzCd(objects)) return;
       onSourceChange(
         patchSelectionTranslation(sourceRef.current, objects, dx, dy),
       );
@@ -4185,6 +4342,12 @@ export function DiagramCanvas({
   const deleteSelection = useCallback(() => {
     const objects = collectSelection(docRef.current, selectedKeysRef.current);
     if (selectionSize(objects) === 0) return;
+    const removable =
+      objects.nodes.some((node) => node.origin !== "tikzcd") ||
+      objects.labels.some((label) => label.origin !== "tikzcd") ||
+      objects.frames.length > 0 ||
+      objects.paths.some((path) => path.origin === "tikzcd");
+    if (!removable) return;
     closeEditor();
     onSelect([]);
     onSourceChange(
@@ -4232,9 +4395,11 @@ export function DiagramCanvas({
       if (previewRef.current) return;
       const current = docRef.current;
       const keys = [
-        ...current.nodes.map((node) => node.key),
-        ...current.labels.map((label) => label.key),
-        ...current.paths.filter(isSelectableEdge).map((path) => path.key),
+        ...current.nodes.filter((node) => node.origin !== "tikzcd").map((node) => node.key),
+        ...current.labels.filter((label) => label.origin !== "tikzcd").map((label) => label.key),
+        ...current.paths
+          .filter((path) => path.origin !== "tikzcd" && isSelectableEdge(path))
+          .map((path) => path.key),
         ...current.frames.map((frame) => frame.key),
       ];
       if (keys.length === 0) return;
@@ -4340,72 +4505,141 @@ export function DiagramCanvas({
     ];
   }, [groupBounds, selectionObjects]);
 
-  const selectionInfo: SelectionInfo | null =
-    selectedCount > 1 && groupBounds
-      ? {
-          eyebrow: "多选",
-          title: `已选择 ${selectedCount} 个组件`,
-          meta: multiMeta,
-          multi: true,
-        }
-      : selectedNode
-        ? {
-            eyebrow: "节点",
-            title: selectedNode.name ? `(${selectedNode.name})` : "未命名节点",
-            meta: [
-              `x ${formatNumber(selectedNode.x)}`,
-              `y ${formatNumber(selectedNode.y)}`,
-              `${formatNumber(selectedNode.width)} × ${formatNumber(selectedNode.height)} cm`,
-            ],
-            editable: selectedNode,
-          }
-        : selectedLabel
-          ? {
-              eyebrow: "标签",
-              title: selectedLabel.above
-                ? "上方标签"
-                : selectedLabel.below
-                  ? "下方标签"
-                  : selectedLabel.left
-                    ? "左侧标签"
-                    : selectedLabel.right
-                      ? "右侧标签"
-                      : "连线标签",
-              meta: [
-                `${formatNumber(selectedLabel.position.x)}, ${formatNumber(selectedLabel.position.y)}`,
-              ],
-              editable: selectedLabel,
-            }
-          : selectedPath
-            ? {
-                eyebrow: "连线",
-                title: `路径 #${selectedPath.index + 1}`,
-                meta: [
-                  selectedPath.style.dotted
-                    ? "点线"
-                    : selectedPath.style.dashed
-                      ? "虚线"
-                      : "实线",
-                  `${selectedPath.subpaths.reduce((total, subpath) => total + subpath.segments.length, 0)} 段`,
-                  `${formatNumber(pathLength(selectedPath))} cm`,
-                  selectedPath.style.arrowStart || selectedPath.style.arrowEnd
-                    ? "带箭头"
-                    : "无箭头",
-                ],
-                path: selectedPath,
-              }
-            : selectedFrame
-              ? {
-                  eyebrow: selectedFrame.isBackground ? "背景板" : "矩形底板",
-                  title: selectedFrame.isBackground ? "背景底板" : "矩形框",
-                  meta: [
-                    `${formatNumber(selectedFrame.width)} × ${formatNumber(selectedFrame.height)} cm`,
-                    `x ${formatNumber(selectedFrame.minX)} → ${formatNumber(selectedFrame.maxX)}`,
-                    `y ${formatNumber(selectedFrame.minY)} → ${formatNumber(selectedFrame.maxY)}`,
-                  ],
-                  resizeHint: true,
-                }
-              : null;
+  let selectionInfo: SelectionInfo | null = null;
+  if (selectedCount > 1 && groupBounds) {
+    selectionInfo = {
+      eyebrow: "多选",
+      title: `已选择 ${selectedCount} 个组件`,
+      meta: multiMeta,
+      multi: true,
+      locked: selectionLocked,
+    };
+  } else if (selectedNode) {
+    if (selectedNode.origin === "tikzcd") {
+      const cell = selectedNode.tikzcdCell;
+      selectionInfo = {
+        eyebrow: "tikz-cd 单元格",
+        title: selectedNode.text || "空单元格",
+        meta: [
+          cell ? `第 ${cell.row + 1} 行 · 第 ${cell.col + 1} 列` : "表格单元格",
+          "数学模式",
+          selectedNode.textEditable ? "双击编辑公式" : "含箭头，文字由源码拆分",
+        ],
+        editable: selectedNode.textEditable ? selectedNode : undefined,
+      };
+    } else {
+      selectionInfo = {
+        eyebrow: "节点",
+        title: selectedNode.name ? `(${selectedNode.name})` : "未命名节点",
+        meta: [
+          `x ${formatNumber(selectedNode.x)}`,
+          `y ${formatNumber(selectedNode.y)}`,
+          `${formatNumber(selectedNode.width)} × ${formatNumber(selectedNode.height)} cm`,
+        ],
+        editable: selectedNode,
+      };
+    }
+  } else if (selectedLabel) {
+    if (selectedLabel.origin === "tikzcd") {
+      selectionInfo = {
+        eyebrow: "箭头标签",
+        title: selectedLabel.text || "空标签",
+        meta: [
+          `位于箭头 ${Math.round(selectedLabel.sourcePosition * 100)}%`,
+          selectedLabel.description ? "描述标签 · 覆盖连线" : "侧向标签 · swap 换边",
+        ],
+        editable: selectedLabel,
+      };
+    } else {
+      selectionInfo = {
+        eyebrow: "标签",
+        title: selectedLabel.above
+          ? "上方标签"
+          : selectedLabel.below
+            ? "下方标签"
+            : selectedLabel.left
+              ? "左侧标签"
+              : selectedLabel.right
+                ? "右侧标签"
+                : "连线标签",
+        meta: [
+          `${formatNumber(selectedLabel.position.x)}, ${formatNumber(selectedLabel.position.y)}`,
+        ],
+        editable: selectedLabel,
+      };
+    }
+  } else if (selectedPath) {
+    if (selectedPath.origin === "tikzcd") {
+      const ends = tikzCdArrowEnds(selectedPath);
+      selectionInfo = {
+        eyebrow: "tikz-cd 箭头",
+        title: `${selectedPath.tikzcd?.fromText || "·"} → ${selectedPath.tikzcd?.toText || "·"}`,
+        meta: [
+          tikzCdLineStyle(selectedPath) === "dotted"
+            ? "点线"
+            : tikzCdLineStyle(selectedPath) === "dashed"
+              ? "虚线"
+              : "实线",
+          ends === "<->"
+            ? "双向箭头"
+            : ends === "<-"
+              ? "反向箭头"
+              : ends === "-"
+                ? "无箭头"
+                : "单向箭头",
+          selectedPath.style.bend
+            ? `${selectedPath.style.bend.direction === "left" ? "左" : "右"}弯 ${selectedPath.style.bend.angle}°`
+            : "直线",
+          selectedPath.style.crossing ? "crossing over" : "",
+        ].filter(Boolean),
+        path: selectedPath,
+      };
+    } else {
+      selectionInfo = {
+        eyebrow: "连线",
+        title: `路径 #${selectedPath.index + 1}`,
+        meta: [
+          selectedPath.style.dotted
+            ? "点线"
+            : selectedPath.style.dashed
+              ? "虚线"
+              : "实线",
+          `${selectedPath.subpaths.reduce((total, subpath) => total + subpath.segments.length, 0)} 段`,
+          `${formatNumber(pathLength(selectedPath))} cm`,
+          selectedPath.style.arrowStart || selectedPath.style.arrowEnd
+            ? "带箭头"
+            : "无箭头",
+        ],
+        path: selectedPath,
+      };
+    }
+  } else if (selectedFrame) {
+    selectionInfo = {
+      eyebrow: selectedFrame.isBackground ? "背景板" : "矩形底板",
+      title: selectedFrame.isBackground ? "背景底板" : "矩形框",
+      meta: [
+        `${formatNumber(selectedFrame.width)} × ${formatNumber(selectedFrame.height)} cm`,
+        `x ${formatNumber(selectedFrame.minX)} → ${formatNumber(selectedFrame.maxX)}`,
+        `y ${formatNumber(selectedFrame.minY)} → ${formatNumber(selectedFrame.maxY)}`,
+      ],
+      resizeHint: true,
+    };
+  }
+
+  const selectionIsCdCell = selectedNode?.origin === "tikzcd";
+  const selectionIsCdLabel = selectedLabel?.origin === "tikzcd";
+  const selectionIsCdArrow = selectedPath?.origin === "tikzcd";
+  const editingObject = editing
+    ? editing.kind === "node"
+      ? doc.nodes.find((node) => node.key === editing.key) ?? null
+      : doc.labels.find((label) => label.key === editing.key) ?? null
+    : null;
+  const editorDefaultHint =
+    editingObject?.origin === "tikzcd"
+      ? editing?.kind === "node"
+        ? "单元格处于数学模式，直接写公式；不能包含 &、\\\\ 或换行。"
+        : '箭头标签处于数学模式；不能包含未转义的英文引号 " 或换行。'
+      : "直接编辑 TikZ 文本，支持 $公式$、\\textbf{} 与 \\\\ 换行。";
 
   return (
     <section
@@ -4704,9 +4938,15 @@ export function DiagramCanvas({
           ) : (
             <>
           <svg className="edge-layer" width="1" height="1" aria-hidden="true">
-            {doc.paths.map((path) => (
-              <EdgePath key={path.key} path={path} />
-            ))}
+            {[...doc.paths]
+              .sort(
+                (a, b) =>
+                  Number(Boolean(a.style.crossing)) -
+                  Number(Boolean(b.style.crossing)),
+              )
+              .map((path) => (
+                <EdgePath key={path.key} path={path} />
+              ))}
           </svg>
 
           {selectedPath ? (
@@ -4728,23 +4968,25 @@ export function DiagramCanvas({
             </svg>
           ) : null}
 
-          {doc.nodes.map((node) => (
-            <NodeView
-              key={node.key}
-              node={node}
-              selected={selectedKeySet.has(node.key)}
-              showHandles={selectedKeys.length === 1 && selectedKeySet.has(node.key)}
-              onPointerDown={startDrag}
-              onPointerMove={moveDrag}
-              onPointerUp={endDrag}
-              onSelect={selectOnly}
-              onEdit={openEditor}
-              onResizeStart={startResize}
-              onResizeMove={moveResize}
-              onResizeEnd={endResize}
-              onAnchorPointerDown={startConnector}
-            />
-          ))}
+          {doc.nodes.map((node) =>
+            node.origin === "tikzcd" && !node.text && !node.textEditable ? null : (
+              <NodeView
+                key={node.key}
+                node={node}
+                selected={selectedKeySet.has(node.key)}
+                showHandles={selectedKeys.length === 1 && selectedKeySet.has(node.key)}
+                onPointerDown={startDrag}
+                onPointerMove={moveDrag}
+                onPointerUp={endDrag}
+                onSelect={selectOnly}
+                onEdit={openEditor}
+                onResizeStart={startResize}
+                onResizeMove={moveResize}
+                onResizeEnd={endResize}
+                onAnchorPointerDown={startConnector}
+              />
+            ),
+          )}
 
           {doc.labels.map((label) => (
             <LabelView
@@ -4951,7 +5193,7 @@ export function DiagramCanvas({
               ))
             : null}
 
-          {selectedCount > 1 && groupBounds ? (
+          {selectedCount > 1 && groupBounds && !selectionLocked ? (
             <div
               className="group-selection"
               style={{
@@ -5210,7 +5452,7 @@ export function DiagramCanvas({
                 <span key={item}>{item}</span>
               ))}
             </div>
-            {selectedNode ? (
+            {selectedNode && !selectionIsCdCell ? (
               <div className="selection-colors">
                 <div className="selection-colors-head">
                   <span>样式</span>
@@ -5260,7 +5502,7 @@ export function DiagramCanvas({
                   拖拽八向锚点引出连线，移动图形时连线自动跟随
                 </p>
               </div>
-            ) : selectedLabel ? (
+            ) : selectedLabel && !selectionIsCdLabel ? (
               <div className="selection-colors">
                 <div className="selection-colors-head">
                   <span>样式</span>
@@ -5281,7 +5523,101 @@ export function DiagramCanvas({
                 ) : null}
               </div>
             ) : null}
-            {selectedPath ? (
+            {selectionIsCdArrow && selectedPath ? (
+              <div className="selection-edge selection-cd-arrow">
+                <div className="selection-bend">
+                  <span className="selection-bend-label">线型</span>
+                  <div
+                    className="selection-bend-switch"
+                    role="group"
+                    aria-label="箭头线型"
+                  >
+                    {(
+                      [
+                        ["solid", "实线"],
+                        ["dashed", "虚线"],
+                        ["dotted", "点线"],
+                      ] as const
+                    ).map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={tikzCdLineStyle(selectedPath) === value ? "is-active" : ""}
+                        aria-pressed={tikzCdLineStyle(selectedPath) === value}
+                        onClick={() => changeTikzCdArrow({ line: value })}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="selection-bend">
+                  <span className="selection-bend-label">箭头</span>
+                  <div
+                    className="selection-bend-switch"
+                    role="group"
+                    aria-label="箭头方向"
+                  >
+                    {(
+                      [
+                        ["->", "→"],
+                        ["<-", "←"],
+                        ["<->", "↔"],
+                        ["-", "—"],
+                      ] as const
+                    ).map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={tikzCdArrowEnds(selectedPath) === value ? "is-active" : ""}
+                        aria-pressed={tikzCdArrowEnds(selectedPath) === value}
+                        title={
+                          value === "->"
+                            ? "箭头指向目标单元格"
+                            : value === "<-"
+                              ? "箭头指向来源单元格"
+                              : value === "<->"
+                                ? "双向箭头"
+                                : "无箭头"
+                        }
+                        onClick={() => changeTikzCdArrow({ ends: value })}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="selection-bend">
+                  <span className="selection-bend-label">弯曲</span>
+                  <div
+                    className="selection-bend-switch"
+                    role="group"
+                    aria-label="箭头弯曲方向"
+                  >
+                    {(
+                      [
+                        ["none", "无"],
+                        ["left", "左"],
+                        ["right", "右"],
+                      ] as const
+                    ).map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={tikzCdBend(selectedPath) === value ? "is-active" : ""}
+                        aria-pressed={tikzCdBend(selectedPath) === value}
+                        onClick={() => changeTikzCdArrow({ bend: value })}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <p className="selection-bend-hint">
+                  修改会写回 \arrow 选项；标签、crossing over 与其他选项保持不变。
+                </p>
+              </div>
+            ) : selectedPath ? (
               <div className="selection-edge">
                 <p className="selection-edge-hint">
                   <span
@@ -5343,32 +5679,60 @@ export function DiagramCanvas({
                 编辑文字
               </button>
             ) : selectionInfo.multi ? (
-              <p className="selection-resize-hint selection-multi-hint">
-                <Scaling size={12} />
-                <span>
-                  拖动任一组件移动全部，四角调整整体大小
-                  <br />
-                  方向键微调 0.01cm，Shift + 方向键 0.1cm
-                </span>
-              </p>
+              selectionInfo.locked ? (
+                <p className="selection-resize-hint selection-multi-hint">
+                  <Scaling size={12} />
+                  <span>
+                    tikz-cd 单元格与箭头由表格源码定位，不能整体移动
+                    <br />
+                    可逐个选中编辑公式、箭头样式或删除箭头
+                  </span>
+                </p>
+              ) : (
+                <p className="selection-resize-hint selection-multi-hint">
+                  <Scaling size={12} />
+                  <span>
+                    拖动任一组件移动全部，四角调整整体大小
+                    <br />
+                    方向键微调 0.01cm，Shift + 方向键 0.1cm
+                  </span>
+                </p>
+              )
             ) : selectionInfo.resizeHint ? (
               <p className="selection-resize-hint">
                 <Scaling size={12} />
                 拖动选中框的边框或顶部标签移动，四角调整大小；框内拖动可继续框选
               </p>
             ) : null}
-            <div className="selection-actions">
-              <button
-                type="button"
-                className="selection-delete"
-                onClick={deleteSelection}
-                title="删除所选组件（Delete / Backspace）"
-              >
-                <Trash2 size={13} />
-                <span>删除所选</span>
-                <kbd>Del</kbd>
-              </button>
-            </div>
+            {selectionIsCdCell ? (
+              <p className="selection-resize-hint">
+                <Scaling size={12} />
+                单元格位置由 &amp; 与 \\ 决定；双击编辑公式，删除请调整表格源码
+              </p>
+            ) : selectionIsCdLabel ? (
+              <p className="selection-resize-hint">
+                <Scaling size={12} />
+                标签位置由箭头选项决定；双击编辑文字，删除请在源码中移除引号选项
+              </p>
+            ) : null}
+            {selectionIsCdCell || selectionIsCdLabel ? null : (
+              <div className="selection-actions">
+                <button
+                  type="button"
+                  className="selection-delete"
+                  onClick={deleteSelection}
+                  title={
+                    selectionIsCdArrow
+                      ? "从单元格中删除该 \\arrow 命令（Delete / Backspace）"
+                      : "删除所选组件（Delete / Backspace）"
+                  }
+                >
+                  <Trash2 size={13} />
+                  <span>{selectionIsCdArrow ? "删除箭头" : "删除所选"}</span>
+                  <kbd>Del</kbd>
+                </button>
+              </div>
+            )}
           </aside>
           )
         ) : null}
@@ -5409,7 +5773,7 @@ export function DiagramCanvas({
               }}
             />
             <p className={`editor-hint${draftError ? " has-error" : ""}`}>
-              {draftError ?? "直接编辑 TikZ 文本，支持 $公式$、\\textbf{} 与 \\\\ 换行。"}
+              {draftError ?? editorDefaultHint}
             </p>
             <div className="text-editor-actions">
               <span className="shortcut-hint">⌘/Ctrl + Enter</span>

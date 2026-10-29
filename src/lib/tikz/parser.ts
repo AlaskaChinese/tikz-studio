@@ -56,6 +56,7 @@ import {
 import { measureTikzText } from "./measure";
 import { parseColorDefinitions, resolveTikzColor } from "./colors";
 import { compileMathExpression, compileSingleVariable } from "./mathExpr";
+import { parseTikzCd } from "./tikzcd";
 
 const KNOWN_PICTURE_COMMANDS = new Set([
   "node",
@@ -1262,6 +1263,15 @@ function parseInternal(source: string): TikzDocument {
         continue;
       }
       cursor = env.afterBegin;
+      if (env.name === "document") {
+        continue;
+      }
+      if (env.name === "tikzcd" || env.name === "tikzcd*") {
+        const endTag = `\\end{${env.name}}`;
+        const envEnd = masked.indexOf(endTag, cursor);
+        cursor = envEnd >= 0 ? envEnd + endTag.length : bodyEnd;
+        continue;
+      }
       if (env.name === "scope") {
         addIssue(state, "scope", "scope 局部变换尚未应用", {
           detail: "当前会解析 scope 内的节点与连线，但会忽略局部的 shift、scale 和样式作用域。",
@@ -1312,6 +1322,15 @@ function parseInternal(source: string): TikzDocument {
     }
     if (commandName === "tikzset" || commandName === "tikzstyle" || commandName === "definecolor" || commandName === "colorlet") {
       cursor = commandEnd;
+      continue;
+    }
+    if (
+      commandName === "usepackage" ||
+      commandName === "documentclass" ||
+      commandName === "usetikzlibrary" ||
+      commandName === "pgfplotsset"
+    ) {
+      cursor = skipGroupCommand(masked, nameEnd, bodyEnd);
       continue;
     }
     if (commandName === "foreach") {
@@ -1494,6 +1513,22 @@ function parseInternal(source: string): TikzDocument {
     if (parsed) paths.push(parsed);
   }
 
+  const tikzcdResult = parseTikzCd(source, masked, {
+    nodeIndexStart: nodes.length,
+    pathIndexStart: paths.length,
+    definitions,
+  });
+  if (tikzcdResult) {
+    nodes.push(...tikzcdResult.nodes);
+    paths.push(...tikzcdResult.paths);
+    for (const issue of tikzcdResult.issues) {
+      if (state.issueKeys.has(issue.id)) continue;
+      state.issueKeys.add(issue.id);
+      state.issues.push(issue);
+    }
+    hasPicture = true;
+  }
+
   const frames: TikzFrame[] = [];
   for (const path of paths) {
     path.subpaths.forEach((subpath, subpathIndex) => {
@@ -1621,6 +1656,7 @@ function parseInternal(source: string): TikzDocument {
     hasPicture,
     pictureSpan,
     colorDefinitions: state.definitions,
+    tikzcd: tikzcdResult?.summary,
   };
 }
 

@@ -4,6 +4,7 @@ export interface TikzExample {
   eyebrow: string;
   code: string;
   preview?: "circuitikz" | "pgfplots" | "tikz-cd" | "chemfig" | "chemfig-fragment";
+  native?: boolean;
 }
 
 export const TIKZ_EXAMPLES: TikzExample[] = [
@@ -290,6 +291,7 @@ C' \arrow[rr,"k'" near end] \arrow[dr,swap,"c"] && D' \arrow[dr,swap,"d"] \\
 
 \end{document}`,
     preview: "tikz-cd",
+    native: true,
   },
   {
     id: "chemfig-lactam",

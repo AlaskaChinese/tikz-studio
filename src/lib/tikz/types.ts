@@ -55,6 +55,23 @@ export interface RelativePlacement {
   distanceCm?: number;
 }
 
+export type ObjectOrigin = "tikzcd";
+
+export interface TikzCdArrowMeta {
+  envIndex: number;
+  commandNameEnd: number;
+  optionBlock?: Span;
+  fromText: string;
+  toText: string;
+}
+
+export interface TikzCdCellMeta {
+  envIndex: number;
+  row: number;
+  col: number;
+  editable: boolean;
+}
+
 export interface TikzNode {
   kind: "node";
   index: number;
@@ -67,6 +84,10 @@ export interface TikzNode {
   contentOpen: number;
   contentClose: number;
   optionBlocks: Span[];
+  origin?: ObjectOrigin;
+  mathMode?: boolean;
+  textEditable?: boolean;
+  tikzcdCell?: TikzCdCellMeta;
   style: NodeStyle;
   styleTokens: ParsedOption[];
   x: number;
@@ -109,6 +130,7 @@ export interface PathStyle {
   bend?: { direction: "left" | "right"; angle: number };
   shortenStart: number;
   shortenEnd: number;
+  crossing?: boolean;
 }
 
 export type SegmentKind = "line" | "horizontal-vertical" | "vertical-horizontal" | "cubic";
@@ -164,6 +186,9 @@ export interface TikzLabel {
   textSpan: Span;
   commandNameEnd: number;
   optionBlocks: Span[];
+  origin?: ObjectOrigin;
+  mathMode?: boolean;
+  description?: boolean;
   sourceShift: Point;
   rawText: string;
   position: Point;
@@ -242,6 +267,8 @@ export interface TikzPath {
   fill: boolean;
   stroke: boolean;
   generated?: boolean;
+  origin?: ObjectOrigin;
+  tikzcd?: TikzCdArrowMeta;
 }
 
 export interface SourceStats {
@@ -249,6 +276,12 @@ export interface SourceStats {
   paths: number;
   labels: number;
   lines: number;
+}
+
+export interface TikzCdSummary {
+  environments: number;
+  native: boolean;
+  warnings: string[];
 }
 
 export interface TikzDocument {
@@ -264,6 +297,7 @@ export interface TikzDocument {
   hasPicture: boolean;
   pictureSpan?: Span;
   colorDefinitions: Record<string, string>;
+  tikzcd?: TikzCdSummary;
 }
 
 export interface DragSnapshot {

@@ -75,7 +75,11 @@ export default function App() {
 
   sourceRef.current = source;
   const doc = useMemo(() => parseTikz(source), [source]);
-  const exactPreview = useMemo(() => getExactPreview(source), [source]);
+  const exactPreview = useMemo(() => {
+    const preview = getExactPreview(source);
+    if (preview && doc.tikzcd?.native) return null;
+    return preview;
+  }, [source, doc]);
   const activeExampleId = useMemo(() => {
     const trimmed = source.trim();
     if (trimmed === BLANK_TIKZ_SOURCE.trim()) return "blank";
@@ -413,7 +417,9 @@ export default function App() {
                     <span className="example-text">
                       <span className="example-name">
                         {example.name}
-                        {example.preview ? (
+                        {example.native ? (
+                          <span className="example-preview-badge is-native">原生可编辑</span>
+                        ) : example.preview ? (
                           <span className="example-preview-badge">TeX 矢量</span>
                         ) : null}
                       </span>
@@ -445,7 +451,7 @@ export default function App() {
                   )}
                 </button>
                 <p className="example-menu-foot">
-                  常用 TikZ 子集原生渲染；circuitikz、pgfplots、tikz-cd 与 chemfig 使用 TeX 预编译的精确矢量预览。
+                  常用 TikZ 与 tikz-cd 子集原生渲染、可直接编辑；circuitikz、pgfplots 与 chemfig 使用 TeX 预编译的精确矢量预览，tikz-cd 超出原生子集时自动回退到预览。
                 </p>
               </div>
             ) : null}
